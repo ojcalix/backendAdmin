@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const auth = require('../middlewares/auth'); // Importamos el middleware
 const db = require('../config/db'); // Importa la conexión correctamente
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 
 
 // Ruta para obtener todos los usuarios

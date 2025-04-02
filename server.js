@@ -12,7 +12,7 @@ const app = express(); // Crea una aplicación Express
 const PORT = 3000; // Define el puerto en el que el servidor estará escuchando
 const db = require('./config/db'); // Importa la conexión
 const jwt = require('jsonwebtoken'); // Importamos JWT
-const bcrypt = require('bcrypt'); // Importamos bcrypt
+const bcrypt = require('bcryptjs'); // Importamos bcrypt
 const SECRET_KEY = 'secreto_super_seguro'; // Declarar la clave secreta aquí
 
 // Aplica middleware global

@@ -16,7 +16,12 @@ const bcrypt = require('bcryptjs'); // Importamos bcrypt
 const SECRET_KEY = 'secreto_super_seguro'; // Declarar la clave secreta aquí
 
 // Aplica middleware global
-app.use(cors()); // Habilita solicitudes desde otros dominios (Cross-Origin Resource Sharing)
+// Habilitar CORS
+app.use(cors({
+    origin: '*', // Permitir acceso desde cualquier origen
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(bodyParser.json()); // Convierte automáticamente el cuerpo de las solicitudes a JSON
 
 const usuariosRoutes = require('./routes/usuarios.routes');

@@ -209,7 +209,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         quantity
     } = req.body;
 
-    let imagePath = req.file ? req.file.filename : null;
+    imagePath = (result[0] && result[0].image) || null; // Mantener la imagen existente
 
     // Verificar si no se subió una nueva imagen
     const selectImageSql = 'SELECT image FROM productos WHERE id = ?';

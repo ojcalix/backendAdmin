@@ -196,9 +196,9 @@ app.get('/api/productos/:id', (req, res) => {
 
 // Backend: Ruta para actualizar un producto
 app.put('/api/productos/:id', upload.single('image'), (req, res) => {
-    const productId = req.params.id; // ID original del producto en la URL
+    const productId = req.params.id;
     const {
-        id, // Nuevo ID (si se cambia)
+        id,
         name,
         brand,
         description,
@@ -209,9 +209,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         quantity
     } = req.body;
 
-    imagePath = (result[0] && result[0].image) || null; // Mantener la imagen existente
-
-    // Verificar si no se subió una nueva imagen
+    // Consultar la imagen actual antes de actualizar
     const selectImageSql = 'SELECT image FROM productos WHERE id = ?';
     db.query(selectImageSql, [productId], (err, result) => {
         if (err) {
@@ -219,11 +217,14 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
             return res.status(500).json({ error: 'Error en la base de datos' });
         }
 
-        if (!imagePath) {
-            imagePath = result[0]?.image || null; // Mantener la imagen existente
+        let imagePath = (result.length > 0) ? result[0].image : null;
+
+        // Si se sube una nueva imagen, reemplazar la existente
+        if (req.file) {
+            imagePath = req.file.path;
         }
 
-        // SQL para actualizar el producto
+        // Ahora sí, actualizar el producto
         const updateSql = `
             UPDATE productos SET 
             id = ?, name = ?, brand = ?, description = ?, 
@@ -233,7 +234,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         `;
 
         db.query(updateSql, [
-            id || productId, // Si no se envía un nuevo ID, usa el actual
+            id || productId,
             name, brand, description, supplier_id, category_id,
             purchase_price, sale_price, quantity, imagePath,
             productId
@@ -246,6 +247,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         });
     });
 });
+
 
 //Ruta para eliminar un product0
 app.delete('/api/productos/:id', async (req, res) => {

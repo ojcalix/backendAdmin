@@ -248,7 +248,6 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
     });
 });
 
-
 //Ruta para eliminar un product0
 app.delete('/api/productos/:id', async (req, res) => {
     const productId = req.params.id;

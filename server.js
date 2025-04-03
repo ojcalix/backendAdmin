@@ -18,7 +18,7 @@ const SECRET_KEY = 'secreto_super_seguro'; // Declarar la clave secreta aquí
 // Aplica middleware global
 // Habilitar CORS
 app.use(cors({
-    origin: 'http://127.0.0.1:5501', // Especifica el origen de tu frontend
+    origin: '*', // Permite solicitudes desde cualquier origen
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -75,21 +75,13 @@ app.post('/login', (req, res) => {
 });
 // Servir archivos estáticos de la carpeta 'uploads'
 // Esto le dice a Express que cualquier archivo que esté en la carpeta 'uploads'
-// se puede acceder desde una URL que comience con '/uploads'.
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-// 'path.join(__dirname, '../uploads')' asegura que la ruta esté correctamente construida, 
-// apuntando a la carpeta 'uploads' en la ubicación correcta, sin importar el sistema operativo.
+// Middleware para servir archivos estáticos
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Configuración de multer para el manejo de archivos subidos
+// Configuración de multer (almacenamiento en memoria)
 const storage = multer.memoryStorage();
-
-// Aquí se configura multer con la opción 'storage' que hemos definido
 const upload = multer({ storage });
 
-// Ruta para agregar productos a la base de datos
-// 'upload.single('productImage')' es el middleware que maneja la carga de una imagen de un solo archivo
-// y la guarda en la carpeta 'uploads'. El campo del formulario se llama 'productImage'.
-// Ruta para agregar productos
 app.post('/api/productos', upload.single('productImage'), async (req, res) => {
     try {
         const {
@@ -101,17 +93,19 @@ app.post('/api/productos', upload.single('productImage'), async (req, res) => {
         let imagePath = null;
 
         if (req.file) {
-            // Ruta donde se guardará la imagen optimizada
-            const uniqueName = `product_${Date.now()}.jpg`; // Nombre único para la imagen
-            const outputPath = path.join(__dirname, '../uploads', uniqueName);
+            // Nombre único para la imagen
+            const uniqueName = `product_${Date.now()}.jpg`;
+            const outputPath = path.join(__dirname, 'uploads', uniqueName);
 
-            // Procesar y convertir la imagen a JPEG optimizado
+            // Guardar la imagen en la carpeta 'uploads'
             await sharp(req.file.buffer)
-                .resize(500, 500, { fit: 'inside' }) // Redimensionar a un máximo de 500x500px
-                .toFormat('jpeg', { quality: 80 })  // Convertir a JPEG con calidad del 80%
+                .resize(500, 500, { fit: 'inside' })
+                .toFormat('jpeg', { quality: 80 })
                 .toFile(outputPath);
 
-            imagePath = uniqueName; // Guardar el nombre del archivo en la BD
+            // Generar URL dinámica usando el host y protocolo actuales
+            const serverUrl = `${req.protocol}://${req.get('host')}`;
+            imagePath = `${serverUrl}/uploads/${uniqueName}`;
         }
 
         // SQL para insertar el producto en la base de datos
@@ -119,19 +113,18 @@ app.post('/api/productos', upload.single('productImage'), async (req, res) => {
         INSERT INTO productos 
         (id, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `;
-    
-    db.query(sql, [
-        productId, productName, productBrand, productDescription, productSupplier,
-        productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
-    ], (err) => {
-        if (err) {
-            console.error('Error al agregar el producto:', err);
-            res.status(500).send('Error al agregar el producto');
-        } else {
+        `;
+
+        db.query(sql, [
+            productId, productName, productBrand, productDescription, productSupplier,
+            productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
+        ], (err) => {
+            if (err) {
+                console.error('Error al agregar el producto:', err);
+                return res.status(500).send('Error al agregar el producto');
+            }
             res.send('Producto agregado correctamente');
-        }
-    });
+        });
 
     } catch (error) {
         console.error('Error procesando la imagen:', error);
@@ -141,61 +134,66 @@ app.post('/api/productos', upload.single('productImage'), async (req, res) => {
 
 // Ruta para cargar todos los productos desde la base de datos
 app.get('/api/productos', (req, res) => {
+    const serverUrl = `${req.protocol}://${req.get('host')}`; // Obtener la URL dinámica
+
     const query = `
     SELECT 
-productos.id AS productId,          -- ID del producto
-    productos.name AS productName,      -- Nombre del producto
-    productos.brand AS productBrand,    -- Marca del producto
-    productos.description AS productDescription, -- Descripción del producto
-    categorias.name AS productCategory, -- Nombre de la categoría del producto
-    proveedores.name AS productSupplier, -- Nombre del proveedor
-    productos.purchase_price AS purchasePrice, -- Precio de compra
-    productos.sale_price AS salePrice,  -- Precio de venta
-    productos.quantity AS productQuantity, -- Cantidad disponible
-    productos.image AS productImage,    -- Ruta de la imagen
-    productos.registration_date AS createdAt -- Fecha de registro
-FROM productos
-LEFT JOIN categorias ON productos.category_id = categorias.id
-LEFT JOIN proveedores ON productos.supplier_id = proveedores.id
-ORDER BY productos.registration_date DESC; -- Ordena por la fecha de registro del producto (de más reciente a más antiguo)
-    `;
+        productos.id AS productId,          
+        productos.name AS productName,      
+        productos.brand AS productBrand,    
+        productos.description AS productDescription, 
+        categorias.name AS productCategory, 
+        proveedores.name AS productSupplier, 
+        productos.purchase_price AS purchasePrice, 
+        productos.sale_price AS salePrice,  
+        productos.quantity AS productQuantity, 
+        productos.image AS productImage,  
+        productos.registration_date AS createdAt 
+    FROM productos
+    LEFT JOIN categorias ON productos.category_id = categorias.id
+    LEFT JOIN proveedores ON productos.supplier_id = proveedores.id
+    ORDER BY productos.registration_date DESC;
+`;
 
-    db.query(query, (err, results) => {
+    db.query(query, [serverUrl], (err, results) => {
         if (err) {
             console.error('Error al cargar los productos:', err);
-            res.status(500).send('Error al cargar los productos');
-        } else {
-            res.status(200).json(results);
+            return res.status(500).send('Error al cargar los productos');
         }
+        res.status(200).json(results);
     });
 });
+
 //Ruta para obtener los productos
 app.get('/api/productos/:id', (req, res) => {
     const productId = req.params.id;
+    const serverUrl = `${req.protocol}://${req.get('host')}`;
 
     const query = `
-        SELECT id AS productId, name AS productName, brand AS productBrand, 
-               description AS productDescription, supplier_id, category_id, 
-               purchase_price AS purchasePrice, sale_price AS salePrice, 
-               quantity AS productQuantity, image AS productImage 
+        SELECT 
+            id AS productId, name AS productName, brand AS productBrand, 
+            description AS productDescription, supplier_id, category_id, 
+            purchase_price AS purchasePrice, sale_price AS salePrice, 
+            quantity AS productQuantity, 
+            CONCAT(?, '/uploads/', image) AS productImage -- Agregar URL completa
         FROM productos 
         WHERE id = ?
     `;
 
-    db.query(query, [productId], (err, results) => {
+    db.query(query, [serverUrl, productId], (err, results) => {
         if (err) {
             console.error('Error al obtener el producto:', err);
-            res.status(500).send('Error al obtener el producto');
-        } else if (results.length === 0) {
-            res.status(404).send('Producto no encontrado');
-        } else {
-            res.status(200).json(results[0]);
+            return res.status(500).send('Error al obtener el producto');
         }
+        if (results.length === 0) {
+            return res.status(404).send('Producto no encontrado');
+        }
+        res.status(200).json(results[0]);
     });
 });
 
 // Backend: Ruta para actualizar un producto
-app.put('/api/productos/:id', upload.single('image'), (req, res) => {
+app.put('/api/productos/:id', upload.single('image'), async (req, res) => {
     const productId = req.params.id;
     const {
         id,
@@ -209,9 +207,11 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         quantity
     } = req.body;
 
+    const serverUrl = `${req.protocol}://${req.get('host')}`;
+
     // Consultar la imagen actual antes de actualizar
     const selectImageSql = 'SELECT image FROM productos WHERE id = ?';
-    db.query(selectImageSql, [productId], (err, result) => {
+    db.query(selectImageSql, [productId], async (err, result) => {
         if (err) {
             console.error('Error al obtener la imagen actual:', err);
             return res.status(500).json({ error: 'Error en la base de datos' });
@@ -221,8 +221,19 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
 
         // Si se sube una nueva imagen, reemplazar la existente
         if (req.file) {
-            imagePath = req.file.path;
+            const uniqueName = `product_${Date.now()}.jpg`;
+            const outputPath = path.join(__dirname, 'uploads', uniqueName);
+
+            await sharp(req.file.buffer)
+                .resize(500, 500, { fit: 'inside' })
+                .toFormat('jpeg', { quality: 80 })
+                .toFile(outputPath);
+
+            imagePath = uniqueName; // Solo guardamos el nombre del archivo
         }
+
+        // Construir la URL completa de la imagen
+        const imageUrl = imagePath ? `${serverUrl}/uploads/${imagePath}` : null;
 
         // Ahora sí, actualizar el producto
         const updateSql = `
@@ -236,7 +247,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         db.query(updateSql, [
             id || productId,
             name, brand, description, supplier_id, category_id,
-            purchase_price, sale_price, quantity, imagePath,
+            purchase_price, sale_price, quantity, imageUrl,
             productId
         ], (err) => {
             if (err) {
@@ -247,6 +258,7 @@ app.put('/api/productos/:id', upload.single('image'), (req, res) => {
         });
     });
 });
+
 
 //Ruta para eliminar un product0
 app.delete('/api/productos/:id', async (req, res) => {

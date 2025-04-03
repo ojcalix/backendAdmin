@@ -116,22 +116,22 @@ app.post('/api/productos', upload.single('productImage'), async (req, res) => {
 
         // SQL para insertar el producto en la base de datos
         const sql = `
-            INSERT INTO productos 
-            (id, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
-
-        db.query(sql, [
-            productId, productName, productBrand, productDescription, productSupplier,
-            productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
-        ], (err) => {
-            if (err) {
-                console.error('Error al agregar el producto:', err);
-                res.status(500).send('Error al agregar el producto');
-            } else {
-                res.send('Producto agregado correctamente');
-            }
-        });
+        INSERT INTO productos 
+        (id, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+    
+    db.query(sql, [
+        productId, productName, productBrand, productDescription, productSupplier,
+        productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
+    ], (err) => {
+        if (err) {
+            console.error('Error al agregar el producto:', err);
+            res.status(500).send('Error al agregar el producto');
+        } else {
+            res.send('Producto agregado correctamente');
+        }
+    });
 
     } catch (error) {
         console.error('Error procesando la imagen:', error);

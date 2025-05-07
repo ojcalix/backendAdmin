@@ -88,26 +88,21 @@ router.post('/', async (req, res) => {
         res.status(500).json({ error: "Error al registrar la venta" });
     }
 });
-
-
 // Ruta para cargar las ventas
 router.get('/', (req, res) => {
     const query = `
-        SELECT 
-        v.id AS id,
-        v.user_id,
-        v.customer_id,
-        vd.product_id,
-        vd.quantity,
-        vd.subtotal,
-        vd.earned_points,
-        v.sale_date
-    FROM
-        ventas v
-    JOIN
-        ventas_detalle vd ON v.id = vd.sale_id ORDER BY v.sale_date DESC
-    `;
-
+        SELECT
+            v.id AS id_venta,
+            u.username AS usuario,
+            CONCAT(c.first_name, ' ', c.last_name) AS cliente,
+            v.total,
+            v.earned_points,
+            v.sale_date
+        FROM ventas v
+        JOIN usuarios u ON v.user_id = u.id
+        LEFT JOIN clientes c ON v.customer_id = c.id
+        ORDER BY v.sale_date DESC
+        `
     db.query(query, (err, results) => {
         if (err) {
             res.status(500).send('Error al obtener las ventas');

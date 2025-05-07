@@ -1,5 +1,5 @@
 const express = require('express');
-const router = express.Router;
+const router = express.Router();
 const db = require('../config/db');
 
 router.post('/', (req, res) => {
@@ -15,3 +15,17 @@ router.post('/', (req, res) => {
         }
     });
 });
+
+router.get('/', (req, res) => {
+    const query = 'SELECT id, category_id, name, description, registration_date FROM subcategorias'
+
+    db.query(query, (err, results) => {
+        if(err){
+            res.status(500).send('Error al obtener las subcategorias')
+        }else{
+            res.status(200).json(results);
+        }
+    });
+});
+
+module.exports = router;

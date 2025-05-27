@@ -65,8 +65,8 @@ app.use('/clientes', clientesRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Inicia el servidor en el puerto definido
-// app.listen escucha las solicitudes en el puerto indicado
-app.listen(PORT, () => {
+// app.listen escucha las solicitudes en el puerto indicado desde todas las interfaces de red
+app.listen(PORT, '0.0.0.0', () => {
     // Indica en la consola que el servidor está corriendo
-    console.log(`Servidor corriendo en http://localhost:${PORT}`);
+    console.log(`Servidor corriendo en http://0.0.0.0:${PORT}`);
 });

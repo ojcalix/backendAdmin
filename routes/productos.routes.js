@@ -95,7 +95,7 @@ router.get('/:id', (req, res) => {
 
     const query = `
         SELECT 
-            id AS productId, name AS productName, brand AS productBrand, 
+            id AS productId, barcode, name AS productName, brand AS productBrand, 
             description AS productDescription, supplier_id, category_id, 
             purchase_price AS purchasePrice, sale_price AS salePrice, 
             quantity AS productQuantity, 

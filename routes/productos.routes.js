@@ -12,7 +12,7 @@ const upload = multer({ storage });
 router.post('/', upload.single('productImage'), async (req, res) => {
     try {
         const {
-            productId, productName, productBrand, productCategory,
+            barcode, productName, productBrand, productCategory,
             productSubCategory, productDescription, productSupplier,
             purchasePrice, salePrice, productQuantity
         } = req.body;
@@ -20,30 +20,26 @@ router.post('/', upload.single('productImage'), async (req, res) => {
         let imagePath = null;
 
         if (req.file) {
-            // Nombre único para la imagen
             const uniqueName = `product_${Date.now()}.jpg`;
             const outputPath = path.join(__dirname, '..', 'uploads', uniqueName);
 
-            // Guardar la imagen en la carpeta 'uploads'
             await sharp(req.file.buffer)
                 .resize(500, 500, { fit: 'inside' })
                 .toFormat('jpeg', { quality: 80 })
                 .toFile(outputPath);
 
-            // Generar URL dinámica usando el host y protocolo actuales
             const serverUrl = `${req.protocol}://${req.get('host')}`;
             imagePath = `${serverUrl}/uploads/${uniqueName}`;
         }
 
-        // SQL para insertar el producto en la base de datos
         const sql = `
         INSERT INTO productos 
-        (id, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
+        (barcode, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         db.query(sql, [
-            productId, productName, productBrand, productDescription, productSupplier,
+            barcode, productName, productBrand, productDescription, productSupplier,
             productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
         ], (err) => {
             if (err) {
@@ -65,7 +61,8 @@ router.get('/', (req, res) => {
 
     const query = `
     SELECT 
-        productos.id AS productId,          
+        productos.id AS productId,
+        productos.barcode AS barCode,          
         productos.name AS productName,      
         productos.brand AS productBrand,    
         productos.description AS productDescription, 

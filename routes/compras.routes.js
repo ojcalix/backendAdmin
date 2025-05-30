@@ -51,7 +51,18 @@ router.post('/', (req, res) => {
 
 //Ruta para obtener las compras
 router.get('/', (req, res) => {
-    const query = 'SELECT id, supplier_id, user_id, purchase_price, purchase_date FROM compras ORDER BY purchase_date DESC';
+    const query = `
+        SELECT 
+        c.id,
+        p.name AS proveedor,
+        u.username AS usuario,
+        c.purchase_price,
+        c.purchase_date
+    FROM compras c 
+    JOIN proveedores p ON c.supplier_id = p.id
+    JOIN usuarios u ON c.user_id = u.id
+    ORDER BY purchase_date DESC
+    `;
 
     db.query(query, (err, result) => {
         if(err){

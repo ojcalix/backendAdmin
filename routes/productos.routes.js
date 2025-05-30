@@ -3,6 +3,7 @@ const router = express.Router();
 const path = require('path');
 const sharp = require('sharp');
 const multer = require('multer');
+const fs = require('fs');
 const db = require('../config/db'); // Ajusta esta ruta según tu estructura
 
 // Configuración de multer (almacenamiento en memoria)
@@ -13,19 +14,19 @@ router.post('/', upload.single('productImage'), async (req, res) => {
     try {
         const {
             barcode, productName, productBrand, productCategory,
-            productSubCategory, productDescription, productSupplier,
-            purchasePrice, salePrice, productQuantity
+            productSubCategory, productDescription, salePrice, productQuantity
         } = req.body;
 
         let imagePath = null;
 
         if (req.file) {
-            const uniqueName = `product_${Date.now()}.jpg`;
+            const sanitizedProductName = productName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+            const uniqueName = `${sanitizedProductName}_${Date.now()}.webp`;
             const outputPath = path.join(__dirname, '..', 'uploads', uniqueName);
 
             await sharp(req.file.buffer)
-                .resize(500, 500, { fit: 'inside' })
-                .toFormat('jpeg', { quality: 80 })
+                .resize(400, 400, { fit: 'inside' }) // puedes ajustar a 300x300 si lo deseas
+                .webp({ quality: 60 }) // puedes bajar a 50 o incluso 40 para aún menos peso
                 .toFile(outputPath);
 
             const serverUrl = `${req.protocol}://${req.get('host')}`;
@@ -34,13 +35,13 @@ router.post('/', upload.single('productImage'), async (req, res) => {
 
         const sql = `
         INSERT INTO productos 
-        (barcode, name, brand, description, supplier_id, category_id, subcategory_id, purchase_price, sale_price, quantity, image) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (barcode, name, brand, description, category_id, subcategory_id, sale_price, quantity, image) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
         db.query(sql, [
-            barcode, productName, productBrand, productDescription, productSupplier,
-            productCategory, productSubCategory, purchasePrice, salePrice, productQuantity, imagePath
+            barcode, productName, productBrand, productDescription,
+            productCategory, productSubCategory, salePrice, productQuantity, imagePath
         ], (err) => {
             if (err) {
                 console.error('Error al agregar el producto:', err);
@@ -66,16 +67,13 @@ router.get('/', (req, res) => {
         productos.name AS productName,      
         productos.brand AS productBrand,    
         productos.description AS productDescription, 
-        categorias.name AS productCategory, 
-        proveedores.name AS productSupplier, 
-        productos.purchase_price AS purchasePrice, 
+        categorias.name AS productCategory,
         productos.sale_price AS salePrice,  
         productos.quantity AS productQuantity, 
         productos.image AS productImage,  
         productos.registration_date AS createdAt 
     FROM productos
     LEFT JOIN categorias ON productos.category_id = categorias.id
-    LEFT JOIN proveedores ON productos.supplier_id = proveedores.id
     ORDER BY productos.registration_date DESC;
 `;
 
@@ -96,15 +94,13 @@ router.get('/:id', (req, res) => {
     const query = `
         SELECT 
             id AS productId, barcode, name AS productName, brand AS productBrand, 
-            description AS productDescription, supplier_id, category_id, 
-            purchase_price AS purchasePrice, sale_price AS salePrice, 
-            quantity AS productQuantity, 
-            CONCAT(?, '/uploads/', image) AS productImage -- Agregar URL completa
+            description AS productDescription, category_id, sale_price AS salePrice, 
+            quantity AS productQuantity, image AS productImage
         FROM productos 
         WHERE id = ?
     `;
 
-    db.query(query, [serverUrl, productId], (err, results) => {
+    db.query(query, [productId], (err, results) => {
         if (err) {
             console.error('Error al obtener el producto:', err);
             return res.status(500).send('Error al obtener el producto');
@@ -118,23 +114,20 @@ router.get('/:id', (req, res) => {
 
 // Backend: Ruta para actualizar un producto
 router.put('/:id', upload.single('image'), async (req, res) => {
-    
     const productId = req.params.id;
     const {
         id,
+        barcode,
         name,
         brand,
         description,
-        supplier_id,
         category_id,
-        purchase_price,
         sale_price,
         quantity
     } = req.body;
 
     const serverUrl = `${req.protocol}://${req.get('host')}`;
 
-    // Consultar la imagen actual antes de actualizar
     const selectImageSql = 'SELECT image FROM productos WHERE id = ?';
     db.query(selectImageSql, [productId], async (err, result) => {
         if (err) {
@@ -144,35 +137,57 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
         let imagePath = (result.length > 0) ? result[0].image : null;
 
-        // Si se sube una nueva imagen, reemplazar la existente
+        // Si se sube una nueva imagen
         if (req.file) {
-            const uniqueName = `product_${Date.now()}.jpg`;
+            // Eliminar imagen anterior del sistema de archivos
+            if (imagePath && imagePath.includes('/uploads/')) {
+                const oldImageName = imagePath.split('/uploads/')[1];
+                const oldImagePath = path.join(__dirname, '..', 'uploads', oldImageName);
+                fs.unlink(oldImagePath, (unlinkErr) => {
+                    if (unlinkErr) {
+                        console.warn('No se pudo eliminar la imagen anterior:', unlinkErr.message);
+                    } else {
+                        console.log('Imagen anterior eliminada:', oldImagePath);
+                    }
+                });
+            }
+
+            // Procesar nueva imagen
+            const sanitizedProductName = name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+            const uniqueName = `${sanitizedProductName}_${Date.now()}.webp`;
             const outputPath = path.join(__dirname, '..', 'uploads', uniqueName);
 
-            await sharp(req.file.buffer)
-                .resize(500, 500, { fit: 'inside' })
-                .toFormat('jpeg', { quality: 80 })
-                .toFile(outputPath);
+            try {
+                await sharp(req.file.buffer)
+                    .resize(400, 400, { fit: 'inside' })
+                    .webp({ quality: 60 })
+                    .toFile(outputPath);
 
-            imagePath = uniqueName; // Solo guardamos el nombre del archivo
+                imagePath = `${serverUrl}/uploads/${uniqueName}`;
+            } catch (err) {
+                console.error('Error procesando la nueva imagen:', err);
+                return res.status(500).json({ error: 'Error procesando la imagen' });
+            }
         }
 
-        // Construir la URL completa de la imagen
-        const imageUrl = imagePath ? `${serverUrl}/uploads/${imagePath}` : null;
-
-        // Ahora sí, actualizar el producto
         const updateSql = `
             UPDATE productos SET 
-            id = ?, name = ?, brand = ?, description = ?, 
-            supplier_id = ?, category_id = ?, purchase_price = ?, 
-            sale_price = ?, quantity = ?, image = ?
+                id = ?, 
+                barcode = ?, 
+                name = ?, 
+                brand = ?, 
+                description = ?, 
+                category_id = ?, 
+                sale_price = ?, 
+                quantity = ?, 
+                image = ?
             WHERE id = ?
         `;
 
         db.query(updateSql, [
             id || productId,
-            name, brand, description, supplier_id, category_id,
-            purchase_price, sale_price, quantity, imageUrl,
+            barcode, name, brand, description, category_id,
+            sale_price, quantity, imagePath,
             productId
         ], (err) => {
             if (err) {
@@ -183,7 +198,6 @@ router.put('/:id', upload.single('image'), async (req, res) => {
         });
     });
 });
-
 
 //Ruta para eliminar un product0
 router.delete('/:id', async (req, res) => {

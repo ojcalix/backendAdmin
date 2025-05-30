@@ -11,7 +11,7 @@ const db = mysql.createPool({
 
 async function insertarUsuario() {
     const username = 'ojcalix';
-    const password = '1234'; // La contraseña en texto plano
+    const password = 'Shekelo2025'; // La contraseña en texto plano
     const email = 'ojcalix@outlook.es'; // Valor para el campo email
     const role = 'Administrador'; // Valor para el campo role
 

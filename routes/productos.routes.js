@@ -240,5 +240,35 @@ router.post('/', upload.single('productImage'), (req, res) => {
     });
 });
 
+// routes/productos.js
+// 🔍 Búsqueda por id, barcode o nombre
+router.get('/buscar/:term', (req, res) => {
+  const { term } = req.params;
+
+  const sql = `
+    SELECT  p.id           AS productId,
+            p.barcode      AS barCode,
+            p.name         AS productName,
+            c.name         AS productCategory,
+            p.quantity     AS productQuantity,
+            p.image        AS productImage
+    FROM    productos p
+    LEFT JOIN categorias c ON p.category_id = c.id
+    WHERE   p.id      = ?          -- id exacto
+       OR   p.barcode = ?          -- barcode exacto
+       OR   p.name    LIKE ?       -- nombre parcial
+    ORDER BY p.name
+    LIMIT 100
+  `;
+
+  db.query(sql, [term, term, `%${term}%`], (err, rows) => {
+    if (err) {
+      console.error('Error en la búsqueda:', err);
+      return res.status(500).send('Error en la búsqueda');
+    }
+    res.status(200).json(rows);
+  });
+});
+
 module.exports = router;
 

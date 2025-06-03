@@ -132,46 +132,30 @@ router.get('/', (req, res) => {
     });
 });
 //Ruta para obtener los productos
-router.get('/', async (req, res) => {
-  const page  = Math.max(parseInt(req.query.page)  || 1, 1);
-  const limit = Math.max(parseInt(req.query.limit) || 5, 1);
-  const offset = (page - 1) * limit;
+//Ruta para obtener los productosMore actions
+router.get('/:id', (req, res) => {
+    const productId = req.params.id;
+    const serverUrl = `${req.protocol}://${req.get('host')}`;
 
-  try {
-    // total de productos
-    const [[{ total }]] = await db.query('SELECT COUNT(*) AS total FROM productos');
+    const query = `
+        SELECT 
+            id AS productId, barcode, name AS productName, brand AS productBrand, 
+            description AS productDescription, category_id, sale_price AS salePrice, 
+            quantity AS productQuantity, image AS productImage
+        FROM productos 
+        WHERE id = ?
+    `;
 
-    // página solicitada
-    const [products] = await db.query(
-      `SELECT
-         p.id                AS productId,
-         p.barcode           AS barCode,
-         p.name              AS productName,
-         p.brand             AS productBrand,
-         p.description       AS productDescription,
-         c.name              AS productCategory,
-         p.sale_price        AS salePrice,
-         p.quantity          AS productQuantity,
-         p.image             AS productImage,
-         p.registration_date AS createdAt
-       FROM productos p
-       LEFT JOIN categorias c ON p.category_id = c.id
-       ORDER BY p.registration_date DESC
-       LIMIT ? OFFSET ?`,
-      [limit, offset]
-    );
-
-    res.json({
-      products,
-      currentPage : page,
-      totalPages  : Math.ceil(total / limit),
-      totalItems  : total,
-      limit
+    db.query(query, [productId], (err, results) => {
+        if (err) {
+            console.error('Error al obtener el producto:', err);
+            return res.status(500).send('Error al obtener el producto');
+        }
+        if (results.length === 0) {
+            return res.status(404).send('Producto no encontrado');
+        }
+        res.status(200).json(results[0]);
     });
-  } catch (err) {
-    console.error('Error al obtener productos paginados:', err);
-    res.status(500).json({ message: 'Error al obtener productos' });
-  }
 });
 
 // Backend: Ruta para actualizar un producto

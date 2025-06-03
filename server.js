@@ -17,6 +17,7 @@ const SECRET_KEY = 'secreto_super_seguro'; // Declarar la clave secreta aquí
 // Configuración de multer (almacenamiento en memoria)
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
+require('dotenv').config();
 
 // Aplica middleware global
 // Habilitar CORS

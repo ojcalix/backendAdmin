@@ -4,11 +4,22 @@ const path = require('path');
 const sharp = require('sharp');
 const multer = require('multer');
 const fs = require('fs');
+const { Readable } = require('stream');
+const cloudinary = require('../config/cloudinary');
+const streamifier = require('streamifier');
 const db = require('../config/db'); // Ajusta esta ruta según tu estructura
 
 // Configuración de multer (almacenamiento en memoria)
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
+
+// Convierte un buffer a un stream legible
+function bufferToStream(buffer) {
+    const stream = new Readable();
+    stream.push(buffer);
+    stream.push(null);
+    return stream;
+}
 
 router.post('/', upload.single('productImage'), async (req, res) => {
     try {
@@ -20,17 +31,29 @@ router.post('/', upload.single('productImage'), async (req, res) => {
         let imagePath = null;
 
         if (req.file) {
-            const sanitizedProductName = productName.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
-            const uniqueName = `${sanitizedProductName}_${Date.now()}.webp`;
-            const outputPath = path.join(__dirname, '..', 'uploads', uniqueName);
+            const resizedImageBuffer = await sharp(req.file.buffer)
+                .resize(400, 400, { fit: 'inside' })
+                .webp({ quality: 60 })
+                .toBuffer();
 
-            await sharp(req.file.buffer)
-                .resize(400, 400, { fit: 'inside' }) // puedes ajustar a 300x300 si lo deseas
-                .webp({ quality: 60 }) // puedes bajar a 50 o incluso 40 para aún menos peso
-                .toFile(outputPath);
+            const publicId = `${productName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}`;
 
-            const serverUrl = `${req.protocol}://${req.get('host')}`;
-            imagePath = `${serverUrl}/uploads/${uniqueName}`;
+            const uploadResult = await new Promise((resolve, reject) => {
+                const stream = cloudinary.uploader.upload_stream(
+                    {
+                        folder: 'productos',
+                        public_id: publicId,
+                        resource_type: 'image',
+                    },
+                    (error, result) => {
+                        if (error) reject(error);
+                        else resolve(result);
+                    }
+                );
+                bufferToStream(resizedImageBuffer).pipe(stream);
+            });
+
+            imagePath = uploadResult.secure_url;
         }
 
         const sql = `
@@ -58,58 +81,97 @@ router.post('/', upload.single('productImage'), async (req, res) => {
 
 // Ruta para cargar todos los productos desde la base de datos
 router.get('/', (req, res) => {
-    const serverUrl = `${req.protocol}://${req.get('host')}`; // Obtener la URL dinámica
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.max(parseInt(req.query.limit) || 5, 1);
+    const offset = (page - 1) * limit;
 
-    const query = `
-    SELECT 
-        productos.id AS productId,
-        productos.barcode AS barCode,          
-        productos.name AS productName,      
-        productos.brand AS productBrand,    
-        productos.description AS productDescription, 
-        categorias.name AS productCategory,
-        productos.sale_price AS salePrice,  
-        productos.quantity AS productQuantity, 
-        productos.image AS productImage,  
-        productos.registration_date AS createdAt 
-    FROM productos
-    LEFT JOIN categorias ON productos.category_id = categorias.id
-    ORDER BY productos.registration_date DESC;
-`;
-
-    db.query(query, [serverUrl], (err, results) => {
+    // 1️⃣ Total de productos
+    const totalQuery = 'SELECT COUNT(*) AS total FROM productos';
+    db.query(totalQuery, (err, totalResult) => {
         if (err) {
-            console.error('Error al cargar los productos:', err);
-            return res.status(500).send('Error al cargar los productos');
+            console.error('Error al contar productos:', err);
+            return res.status(500).json({ message: 'Error al contar productos' });
         }
-        res.status(200).json(results);
+
+        const total = totalResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        // 2️⃣ Productos paginados
+        const productQuery = `
+            SELECT 
+                productos.id AS productId,
+                productos.barcode AS barCode,
+                productos.name AS productName,
+                productos.brand AS productBrand,
+                productos.description AS productDescription,
+                categorias.name AS productCategory,
+                productos.sale_price AS salePrice,
+                productos.quantity AS productQuantity,
+                productos.image AS productImage,
+                productos.registration_date AS createdAt
+            FROM productos
+            LEFT JOIN categorias ON productos.category_id = categorias.id
+            ORDER BY productos.registration_date DESC
+            LIMIT ? OFFSET ?
+        `;
+
+        db.query(productQuery, [limit, offset], (err, productResults) => {
+            if (err) {
+                console.error('Error al obtener productos paginados:', err);
+                return res.status(500).json({ message: 'Error al obtener productos' });
+            }
+
+            res.status(200).json({
+                products: productResults,
+                currentPage: page,
+                totalPages,
+                totalItems: total,
+                limit
+            });
+        });
     });
 });
-
 //Ruta para obtener los productos
-router.get('/:id', (req, res) => {
-    const productId = req.params.id;
-    const serverUrl = `${req.protocol}://${req.get('host')}`;
+router.get('/', async (req, res) => {
+  const page  = Math.max(parseInt(req.query.page)  || 1, 1);
+  const limit = Math.max(parseInt(req.query.limit) || 5, 1);
+  const offset = (page - 1) * limit;
 
-    const query = `
-        SELECT 
-            id AS productId, barcode, name AS productName, brand AS productBrand, 
-            description AS productDescription, category_id, sale_price AS salePrice, 
-            quantity AS productQuantity, image AS productImage
-        FROM productos 
-        WHERE id = ?
-    `;
+  try {
+    // total de productos
+    const [[{ total }]] = await db.query('SELECT COUNT(*) AS total FROM productos');
 
-    db.query(query, [productId], (err, results) => {
-        if (err) {
-            console.error('Error al obtener el producto:', err);
-            return res.status(500).send('Error al obtener el producto');
-        }
-        if (results.length === 0) {
-            return res.status(404).send('Producto no encontrado');
-        }
-        res.status(200).json(results[0]);
+    // página solicitada
+    const [products] = await db.query(
+      `SELECT
+         p.id                AS productId,
+         p.barcode           AS barCode,
+         p.name              AS productName,
+         p.brand             AS productBrand,
+         p.description       AS productDescription,
+         c.name              AS productCategory,
+         p.sale_price        AS salePrice,
+         p.quantity          AS productQuantity,
+         p.image             AS productImage,
+         p.registration_date AS createdAt
+       FROM productos p
+       LEFT JOIN categorias c ON p.category_id = c.id
+       ORDER BY p.registration_date DESC
+       LIMIT ? OFFSET ?`,
+      [limit, offset]
+    );
+
+    res.json({
+      products,
+      currentPage : page,
+      totalPages  : Math.ceil(total / limit),
+      totalItems  : total,
+      limit
     });
+  } catch (err) {
+    console.error('Error al obtener productos paginados:', err);
+    res.status(500).json({ message: 'Error al obtener productos' });
+  }
 });
 
 // Backend: Ruta para actualizar un producto
@@ -126,8 +188,6 @@ router.put('/:id', upload.single('image'), async (req, res) => {
         quantity
     } = req.body;
 
-    const serverUrl = `${req.protocol}://${req.get('host')}`;
-
     const selectImageSql = 'SELECT image FROM productos WHERE id = ?';
     db.query(selectImageSql, [productId], async (err, result) => {
         if (err) {
@@ -139,34 +199,43 @@ router.put('/:id', upload.single('image'), async (req, res) => {
 
         // Si se sube una nueva imagen
         if (req.file) {
-            // Eliminar imagen anterior del sistema de archivos
-            if (imagePath && imagePath.includes('/uploads/')) {
-                const oldImageName = imagePath.split('/uploads/')[1];
-                const oldImagePath = path.join(__dirname, '..', 'uploads', oldImageName);
-                fs.unlink(oldImagePath, (unlinkErr) => {
-                    if (unlinkErr) {
-                        console.warn('No se pudo eliminar la imagen anterior:', unlinkErr.message);
-                    } else {
-                        console.log('Imagen anterior eliminada:', oldImagePath);
-                    }
-                });
+            // Eliminar imagen anterior de Cloudinary si existe
+            if (imagePath && imagePath.includes('res.cloudinary.com')) {
+                const publicId = imagePath.split('/').pop().split('.')[0];
+                try {
+                    await cloudinary.uploader.destroy(publicId);
+                    console.log('Imagen anterior eliminada de Cloudinary:', publicId);
+                } catch (destroyErr) {
+                    console.warn('No se pudo eliminar la imagen anterior en Cloudinary:', destroyErr.message);
+                }
             }
 
-            // Procesar nueva imagen
-            const sanitizedProductName = name.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
-            const uniqueName = `${sanitizedProductName}_${Date.now()}.webp`;
-            const outputPath = path.join(__dirname, '..', 'uploads', uniqueName);
+            // Subir nueva imagen a Cloudinary
+            const streamUpload = (reqFileBuffer) => {
+                return new Promise((resolve, reject) => {
+                    const stream = cloudinary.uploader.upload_stream(
+                        {
+                            folder: 'productos',
+                            format: 'webp',
+                            transformation: [{ width: 400, height: 400, crop: 'limit' }],
+                        },
+                        (error, result) => {
+                            if (result) {
+                                resolve(result.secure_url);
+                            } else {
+                                reject(error);
+                            }
+                        }
+                    );
+                    streamifier.createReadStream(reqFileBuffer).pipe(stream);
+                });
+            };
 
             try {
-                await sharp(req.file.buffer)
-                    .resize(400, 400, { fit: 'inside' })
-                    .webp({ quality: 60 })
-                    .toFile(outputPath);
-
-                imagePath = `${serverUrl}/uploads/${uniqueName}`;
-            } catch (err) {
-                console.error('Error procesando la nueva imagen:', err);
-                return res.status(500).json({ error: 'Error procesando la imagen' });
+                imagePath = await streamUpload(req.file.buffer);
+            } catch (uploadErr) {
+                console.error('Error al subir imagen a Cloudinary:', uploadErr);
+                return res.status(500).json({ error: 'Error subiendo la imagen' });
             }
         }
 
@@ -198,6 +267,7 @@ router.put('/:id', upload.single('image'), async (req, res) => {
         });
     });
 });
+
 
 //Ruta para eliminar un product0
 router.delete('/:id', async (req, res) => {

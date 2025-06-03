@@ -131,11 +131,38 @@ router.get('/', (req, res) => {
         });
     });
 });
+//Cargar la imagen del producto a la tabla de compras, para la visualizacion del producto que se esta comprando
+router.get('/todos', (req, res) => {
+    const query = `
+        SELECT 
+            productos.id AS productId,
+            productos.barcode AS barCode,
+            productos.name AS productName,
+            productos.brand AS productBrand,
+            productos.description AS productDescription,
+            categorias.name AS productCategory,
+            productos.sale_price AS salePrice,
+            productos.quantity AS productQuantity,
+            productos.image AS productImage,
+            productos.registration_date AS createdAt
+        FROM productos
+        LEFT JOIN categorias ON productos.category_id = categorias.id
+        ORDER BY productos.id DESC
+    `;
+
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Error al obtener productos:', err);
+            res.status(500).send('Error al obtener productos');
+        } else {
+            res.status(200).json(results);
+        }
+    });
+});
+
 //Ruta para obtener los productos
-//Ruta para obtener los productosMore actions
 router.get('/:id', (req, res) => {
     const productId = req.params.id;
-    const serverUrl = `${req.protocol}://${req.get('host')}`;
 
     const query = `
         SELECT 
@@ -252,7 +279,6 @@ router.put('/:id', upload.single('image'), async (req, res) => {
     });
 });
 
-
 //Ruta para eliminar un product0
 router.delete('/:id', async (req, res) => {
     const productId = req.params.id;
@@ -266,19 +292,6 @@ router.delete('/:id', async (req, res) => {
         }
     })
 })
-
-//Cargar la imagen del producto a la tabla de compras, para la visualizacion del producto que se esta comprando
-router.get('/', (req, res) => {
-    const query = `SELECT id AS productId, name AS productName, sale_price AS salePrice, quantity AS productQuantity, image AS productImage FROM productos ORDER BY id DESC`;
-    db.query(query, (err, results) => {
-        if (err) {
-            console.error('Error al obtener productos:', err);
-            res.status(500).send('Error al obtener productos');
-        } else {
-            res.status(200).json(results);
-        }
-    });
-});
 
 router.post('/', upload.single('productImage'), (req, res) => {
     const { productId, productName, salePrice, productQuantity } = req.body;

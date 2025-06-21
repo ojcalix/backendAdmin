@@ -6,7 +6,7 @@ const db = require('../config/db'); // Importa la conexión correctamente
 router.post('/', async (req, res) => {
     const { user_id, customer_id, total, earned_points, products } = req.body;
 
-    if (!user_id || !customer_id || !products.length) {
+    if (!user_id || !products.length) {
         return res.status(400).json({ error: "Datos incompletos." });
     }
 
@@ -67,7 +67,7 @@ router.post('/', async (req, res) => {
         );
 
         // Registrar los puntos en historial_puntos si aplica
-        if (totalEarnedPoints > 0) {
+        if (totalEarnedPoints > 0 && customer_id !== null) {
             await db.promise().query(
                 "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'earned')",
                 [customer_id, sale_id, totalEarnedPoints]
@@ -112,4 +112,39 @@ router.get('/', (req, res) => {
     })
 });
 
+//Obteniendo la factura del cliente
+    // GET /ventas/:id
+    router.get('/:id', async (req, res) => {
+        const { id } = req.params;
+
+        try {
+            // Obtener venta y datos del cliente y usuario
+            const [venta] = await db.promise().query(`
+            SELECT v.id, v.total, v.sale_date, u.username, 
+                   CONCAT(c.first_name, ' ', c.last_name) AS customer
+            FROM ventas v
+            JOIN usuarios u ON v.user_id = u.id
+            LEFT JOIN clientes c ON v.customer_id = c.id
+            WHERE v.id = ?
+        `, [id]);
+
+            if (!venta.length) return res.status(404).json({ error: 'Venta no encontrada' });
+
+            // Obtener detalle de productos
+            const [detalle] = await db.promise().query(`
+            SELECT p.name, vd.quantity, (vd.subtotal / vd.quantity) AS precio_unitario, vd.subtotal
+            FROM ventas_detalle vd
+            JOIN productos p ON vd.product_id = p.id
+            WHERE vd.sale_id = ?
+        `, [id]);
+
+            res.json({
+                venta: venta[0],
+                productos: detalle
+            });
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: 'Error al obtener la venta' });
+        }
+    });
 module.exports = router;

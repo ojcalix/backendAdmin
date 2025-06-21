@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db'); // Importa la conexión correctamente
+const { route } = require('./productos.routes');
 
 //Ruta para hacer el insert de compra de productos
 router.post('/', (req, res) => {
@@ -69,6 +70,25 @@ router.get('/', (req, res) => {
             res.status(500).send('El servidor tiene problemas para obtener las compras');
         }else{
             res.status(200).send(result);
+        }
+    });
+});
+
+//Buscar proveedor por nombre
+router.get('/buscar/:term', (req, res) => {
+    const term = `%${req.params.term}%`;
+    const query = `
+        SELECT id, name, phone
+        FROM proveedores
+        WHERE name LIKE ?
+        LIMIT 50
+    `;
+
+    db.query(query, [term], (err, results) => {
+        if(err){
+            res.status(500).send('Error al buscar el proveedor');
+        }else{
+            res.status(200).json(results);
         }
     });
 });

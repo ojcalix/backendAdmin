@@ -313,17 +313,22 @@ router.get('/buscar/:term', (req, res) => {
   const { term } = req.params;
 
   const sql = `
-    SELECT  p.id           AS productId,
-            p.barcode      AS barCode,
-            p.name         AS productName,
-            c.name         AS productCategory,
-            p.quantity     AS productQuantity,
-            p.image        AS productImage
-    FROM    productos p
+    SELECT 
+        p.id AS productId,
+        p.barcode AS barCode,
+        p.name AS productName,
+        p.brand AS productBrand,
+        p.description AS productDescription,
+        p.sale_price AS salePrice,
+        p.quantity AS productQuantity,
+        p.image AS productImage,
+        p.registration_date AS createdAt,
+        c.name AS productCategory
+    FROM productos p
     LEFT JOIN categorias c ON p.category_id = c.id
-    WHERE   p.id      = ?          -- id exacto
-       OR   p.barcode = ?          -- barcode exacto
-       OR   p.name    LIKE ?       -- nombre parcial
+    WHERE p.id = ? 
+       OR p.barcode = ? 
+       OR p.name LIKE ?
     ORDER BY p.name
     LIMIT 100
   `;

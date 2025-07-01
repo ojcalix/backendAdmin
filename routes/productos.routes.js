@@ -21,7 +21,10 @@ function bufferToStream(buffer) {
     return stream;
 }
 
-router.post('/', upload.single('productImage'), async (req, res) => {
+router.post('/', upload.fields([
+    { name: 'productImage', maxCount: 1 },
+    { name: 'toneImages', maxCount: 20 }
+]), async (req, res) => {
     try {
         const {
             barcode, productName, productBrand, productCategory,
@@ -30,8 +33,11 @@ router.post('/', upload.single('productImage'), async (req, res) => {
 
         let imagePath = null;
 
-        if (req.file) {
-            const resizedImageBuffer = await sharp(req.file.buffer)
+        // Guardar imagen principal
+        const productImageFile = req.files?.productImage?.[0];
+
+        if (productImageFile) {
+            const resizedImageBuffer = await sharp(productImageFile.buffer)
                 .resize(400, 400, { fit: 'inside' })
                 .webp({ quality: 60 })
                 .toBuffer();
@@ -56,28 +62,82 @@ router.post('/', upload.single('productImage'), async (req, res) => {
             imagePath = uploadResult.secure_url;
         }
 
-        const sql = `
-        INSERT INTO productos 
-        (barcode, name, brand, description, category_id, subcategory_id, sale_price, quantity, image) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        // Insertar producto
+        const insertSql = `
+            INSERT INTO productos 
+            (barcode, name, brand, description, category_id, subcategory_id, sale_price, quantity, image) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
-        db.query(sql, [
+        db.query(insertSql, [
             barcode, productName, productBrand, productDescription,
             productCategory, productSubCategory, salePrice, productQuantity, imagePath
-        ], (err) => {
+        ], async (err, result) => {
             if (err) {
-                console.error('Error al agregar el producto:', err);
+                console.error('Error al insertar producto:', err);
                 return res.status(500).send('Error al agregar el producto');
             }
-            res.send('Producto agregado correctamente');
+
+            const productId = result.insertId;
+
+            // Procesar tonos si existen
+            const toneNames = Array.isArray(req.body.toneNames)
+                ? req.body.toneNames
+                : req.body.toneNames ? [req.body.toneNames] : [];
+
+            const toneImages = req.files?.toneImages || [];
+
+            if (toneNames.length && toneImages.length) {
+                for (let i = 0; i < toneNames.length; i++) {
+                    const toneName = toneNames[i];
+                    const imageFile = toneImages[i];
+
+                    if (!toneName || !imageFile) continue;
+
+                    const toneBuffer = await sharp(imageFile.buffer)
+                        .resize(300, 300)
+                        .webp({ quality: 60 })
+                        .toBuffer();
+
+                    const tonePublicId = `${productName.replace(/\s+/g, '_').toLowerCase()}/${toneName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}`;
+
+                    const uploadToneResult = await new Promise((resolve, reject) => {
+                        const stream = cloudinary.uploader.upload_stream(
+                            {
+                                folder: 'tonos',
+                                public_id: tonePublicId,
+                                resource_type: 'image',
+                            },
+                            (error, result) => {
+                                if (error) reject(error);
+                                else resolve(result);
+                            }
+                        );
+                        bufferToStream(toneBuffer).pipe(stream);
+                    });
+
+                    const insertToneSql = `
+                        INSERT INTO tonos (product_id, tone_name, image)
+                        VALUES (?, ?, ?)
+                    `;
+                    db.query(insertToneSql, [productId, toneName, uploadToneResult.secure_url], (toneErr) => {
+                        if (toneErr) {
+                            console.error(`Error al insertar tono "${toneName}":`, toneErr);
+                        }
+                    });
+                }
+            }
+
+            res.send('Producto y tonos agregados correctamente');
         });
 
     } catch (error) {
-        console.error('Error procesando la imagen:', error);
-        res.status(500).send('Error procesando la imagen');
+        console.error('Error procesando el producto o los tonos:', error);
+        res.status(500).send('Error interno al procesar el producto');
     }
 });
+
+
 
 // Ruta para cargar todos los productos desde la base de datos
 router.get('/', (req, res) => {
@@ -310,9 +370,9 @@ router.post('/', upload.single('productImage'), (req, res) => {
 // routes/productos.js
 // 🔍 Búsqueda por id, barcode o nombre
 router.get('/buscar/:term', (req, res) => {
-  const { term } = req.params;
+    const { term } = req.params;
 
-  const sql = `
+    const sql = `
     SELECT 
         p.id AS productId,
         p.barcode AS barCode,
@@ -333,13 +393,13 @@ router.get('/buscar/:term', (req, res) => {
     LIMIT 100
   `;
 
-  db.query(sql, [term, term, `%${term}%`], (err, rows) => {
-    if (err) {
-      console.error('Error en la búsqueda:', err);
-      return res.status(500).send('Error en la búsqueda');
-    }
-    res.status(200).json(rows);
-  });
+    db.query(sql, [term, term, `%${term}%`], (err, rows) => {
+        if (err) {
+            console.error('Error en la búsqueda:', err);
+            return res.status(500).send('Error en la búsqueda');
+        }
+        res.status(200).json(rows);
+    });
 });
 
 module.exports = router;

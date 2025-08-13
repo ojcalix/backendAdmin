@@ -1,87 +1,96 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // Importa la conexión correctamente
+const db = require('../config/db'); // conexión mysql2/promise
 
-//ruta para obtener todos los proveedores
-router.get('/', (req, res) => {
-    const query = 'SELECT id, name, address, phone, email, registration_date FROM proveedores'
-
-    db.query(query, (err, results) => {
-        if (err) {
-            res.status(500).send('Error al cargar proveedores');
-        } else {
-            res.status(200).json(results);
-        }
-    });
+// Ruta para obtener todos los proveedores
+router.get('/', async (req, res) => {
+    try {
+        const query = 'SELECT id, name, address, phone, email, registration_date FROM proveedores';
+        const [results] = await db.query(query);
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error al cargar proveedores:', err);
+        res.status(500).send('Error al cargar proveedores');
+    }
 });
 
-//Ruta para insertar un proveedor
-router.post('/', (req, res) => {
-    const { name, address, phone, email } = req.body;
-
-    const query = 'INSERT INTO proveedores (name, address, phone, email) VALUES (?, ?, ?, ?)';
-
-    db.query(query, [name, address, phone, email], (err, result) => {
-        if (err) {
-            res.status(500).send('Error al ingresar proveedor');
-        } else {
-            res.status(201).json({ message: 'Proveedor agregado correctamente', proveedorId: result.insertId });
-        }
-    });
-
+// Ruta para insertar un proveedor
+router.post('/', async (req, res) => {
+    try {
+        const { name, address, phone, email } = req.body;
+        const query = 'INSERT INTO proveedores (name, address, phone, email) VALUES (?, ?, ?, ?)';
+        
+        const [result] = await db.query(query, [name, address, phone, email]);
+        
+        res.status(201).json({
+            message: 'Proveedor agregado correctamente',
+            proveedorId: result.insertId
+        });
+    } catch (err) {
+        console.error('Error al ingresar proveedor:', err);
+        res.status(500).send('Error al ingresar proveedor');
+    }
 });
 
-//Ruta para obtener un usuario por ID
-router.get('/:id', (req, res) => {
-    const supplierId = req.params.id;
-
-    const query = 'SELECT id, name, address, phone, email FROM proveedores WHERE id = ?';
-
-    db.query(query, [supplierId], (err, results) => {
-        if (err) {
-            res.status(500).send('Error al obtener el usuario');
-        } else if (results.length === 0) {
-            res.status(404).send('Supplier no encontrado')
-        } else {
-            res.status(200).json(results[0]);
+// Ruta para obtener un proveedor por ID
+router.get('/:id', async (req, res) => {
+    try {
+        const supplierId = req.params.id;
+        const query = 'SELECT id, name, address, phone, email FROM proveedores WHERE id = ?';
+        
+        const [results] = await db.query(query, [supplierId]);
+        
+        if (results.length === 0) {
+            return res.status(404).send('Proveedor no encontrado');
         }
-    });
+        
+        res.status(200).json(results[0]);
+    } catch (err) {
+        console.error('Error al obtener proveedor:', err);
+        res.status(500).send('Error al obtener proveedor');
+    }
 });
 
-//Ruta para actualizar un proveedor 
-router.put('/:id', (req, res) => {
-    const supplierId = req.params.id;
-
-    const { name, address, phone, email } = req.body;
-
-    let query = 'UPDATE proveedores SET name = ?, address = ?, phone = ?, email = ?';
-
-    const params = [name, address, phone, email];
-
-    query += ' WHERE id = ?';
-    params.push(supplierId);
-
-    db.query(query, params, (err, result) => {
-        if (err) {
-            res.status(500).send('Error al actualizar supplier');
-        } else {
-            res.status(200).json({ success: true, mesage: 'Usuario actualizado correctamente' });
-        }
-    });
+// Ruta para actualizar un proveedor
+router.put('/:id', async (req, res) => {
+    try {
+        const supplierId = req.params.id;
+        const { name, address, phone, email } = req.body;
+        
+        const query = `
+            UPDATE proveedores
+            SET name = ?, address = ?, phone = ?, email = ?
+            WHERE id = ?
+        `;
+        
+        await db.query(query, [name, address, phone, email, supplierId]);
+        
+        res.status(200).json({
+            success: true,
+            message: 'Proveedor actualizado correctamente'
+        });
+    } catch (err) {
+        console.error('Error al actualizar proveedor:', err);
+        res.status(500).send('Error al actualizar proveedor');
+    }
 });
 
-//RUTA PARA ELIMINAR UN USUARIO
+// Ruta para eliminar un proveedor
 router.delete('/:id', async (req, res) => {
-    const supplierId = req.params.id;
-    const query = 'DELETE FROM proveedores WHERE id = ?'
-
-    db.query(query, [supplierId], (err, result) => {
-        if (err) {
-            res.status(500).send('Error al eliminar usuario');
-        } else {
-            res.status(200).json({ success: true, message: 'Usuario eliminado correctamente.' });
-        }
-    })
-})
+    try {
+        const supplierId = req.params.id;
+        const query = 'DELETE FROM proveedores WHERE id = ?';
+        
+        await db.query(query, [supplierId]);
+        
+        res.status(200).json({
+            success: true,
+            message: 'Proveedor eliminado correctamente'
+        });
+    } catch (err) {
+        console.error('Error al eliminar proveedor:', err);
+        res.status(500).send('Error al eliminar proveedor');
+    }
+});
 
 module.exports = router;

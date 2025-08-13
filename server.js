@@ -59,6 +59,10 @@ app.use('/clientes', clientesRoutes);
 
 const producto_proveedorRouter = require('./routes/producto_proveedor.routes');
 app.use('/producto_proveedor', producto_proveedorRouter);
+//para que UptimeRobot no dispare funciones pesadas en el API
+app.get('/ping', (req, res) => {
+  res.status(200).send('OK');
+});
 
 // Ruta para manejar el inicio de sesión
 // app.post define una ruta para manejar solicitudes POST

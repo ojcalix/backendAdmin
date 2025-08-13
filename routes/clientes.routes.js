@@ -3,20 +3,19 @@ const router = express.Router();
 const db = require('../config/db');
 
 // Obtener todos los clientes
-router.get('/', (req, res) => {
-    const query = 'SELECT id, first_name, last_name, email, phone, accumulated_points, registration_date FROM clientes';
-
-    db.query(query, (err, results) => {
-        if (err) {
-            res.status(500).send('Error retrieving customers');
-        } else {
-            res.status(200).json(results);
-        }
-    });
+router.get('/', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT * FROM clientes');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error retrieving customers:', err);
+        res.status(500).send('Error retrieving customers');
+    }
 });
 
+
 // Buscar clientes por nombre o apellido (para el modal)
-router.get('/buscar/:term', (req, res) => {
+router.get('/buscar/:term', async (req, res) => {
     const term = `%${req.params.term}%`;
     const query = `
         SELECT id, first_name, last_name, phone
@@ -25,13 +24,13 @@ router.get('/buscar/:term', (req, res) => {
         LIMIT 50
     `;
 
-    db.query(query, [term, term], (err, results) => {
-        if (err) {
-            res.status(500).send('Error al buscar clientes');
-        } else {
-            res.status(200).json(results);
-        }
-    });
+    try {
+        const [results] = await db.query(query, [term, term]);
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error al buscar clientes:', err);
+        res.status(500).send('Error al buscar clientes');
+    }
 });
 
 // Obtener un cliente por ID
@@ -52,9 +51,14 @@ router.get('/:id', (req, res) => {
 
 // Agregar un nuevo cliente
 router.post('/', (req, res) => {
-    const { first_name, last_name, email, phone } = req.body;
-    const query = 'INSERT INTO clientes (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)';
+    let { first_name, last_name, email, phone } = req.body;
 
+    // Si el email está vacío, conviértelo a null
+    if (email && email.trim() === '') {
+        email = null;
+    }
+
+    const query = 'INSERT INTO clientes (first_name, last_name, email, phone) VALUES (?, ?, ?, ?)';
     db.query(query, [first_name, last_name, email, phone], (err, results) => {
         if (err) {
             console.error("Error en la consulta SQL:", err);
@@ -63,6 +67,7 @@ router.post('/', (req, res) => {
         res.status(200).json({ message: 'Cliente agregado correctamente', customerId: results.insertId });
     });
 });
+
 
 // Actualizar cliente
 router.put('/:id', (req, res) => {

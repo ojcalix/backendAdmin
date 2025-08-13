@@ -5,7 +5,7 @@ const db = mysql.createConnection({
     user: 'ojcalix', // Usuario de MySQL (debe ser tu usuario configurado)
     password: 'Shekelo2025', // Contraseña para el usuario de MySQL
     database: 'vansue', // Nombre de la base de datos donde se almacenarán los datos
-});
+}).promise();
 
 // Establece la conexión a la base de datos
 db.connect((err) => {

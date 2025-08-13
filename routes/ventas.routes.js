@@ -11,85 +11,98 @@ router.post('/', async (req, res) => {
     }
 
     try {
-        await db.promise().beginTransaction();
+        // ✅ Iniciar transacción
+        await db.beginTransaction();
 
-        // Insertar la venta principal
-        const [ventaResult] = await db.promise().query(
+        // ✅ Insertar venta
+        const [ventaResult] = await db.query(
             "INSERT INTO ventas (user_id, customer_id, total, earned_points) VALUES (?, ?, ?, ?)",
             [user_id, customer_id, total, earned_points]
         );
         const sale_id = ventaResult.insertId;
 
-        let totalEarnedPoints = 0; // Para recalcular el total de puntos
+        let totalEarnedPoints = 0;
 
-        // Procesar cada producto
         for (const product of products) {
-            // Consultar el stock actual del producto
-            const [stockResult] = await db.promise().query(
+            const { product_id, tone_id, quantity, subtotal } = product;
+
+            if (tone_id) {
+                // ✅ Verificar stock en tonos
+                const [toneStockResult] = await db.query(
+                    "SELECT quantity FROM tonos WHERE id = ?",
+                    [tone_id]
+                );
+
+                if (!toneStockResult.length || quantity > toneStockResult[0].quantity) {
+                    await db.rollback();
+                    return res.status(400).json({ error: `Stock insuficiente o tono no encontrado (ID: ${tone_id})` });
+                }
+
+                // ✅ Descontar stock en tonos
+                await db.query(
+                    "UPDATE tonos SET quantity = quantity - ? WHERE id = ?",
+                    [quantity, tone_id]
+                );
+            }
+
+            // ✅ Verificar stock en producto general
+            const [stockResult] = await db.query(
                 "SELECT quantity FROM productos WHERE id = ?",
-                [product.product_id]
+                [product_id]
             );
 
-            if (!stockResult.length) {
-                await db.promise().rollback();
-                return res.status(400).json({ error: `Producto con ID ${product.product_id} no encontrado.` });
+            if (!stockResult.length || quantity > stockResult[0].quantity) {
+                await db.rollback();
+                return res.status(400).json({ error: `Stock insuficiente o producto no encontrado (ID: ${product_id})` });
             }
 
-            const stockDisponible = stockResult[0].quantity;
-
-            // Verificar si hay suficiente stock
-            if (product.quantity > stockDisponible) {
-                await db.promise().rollback();
-                return res.status(400).json({ error: `Stock insuficiente para el producto ${product.product_id}. Disponible: ${stockDisponible}, solicitado: ${product.quantity}.` });
-            }
-
-            // Calcular puntos por cada producto (1 punto por cada 30 LPS en el subtotal)
-            const productEarnedPoints = Math.floor(product.subtotal / 30);
-            totalEarnedPoints += productEarnedPoints;
-
-            // Insertar el detalle de la venta
-            await db.promise().query(
-                "INSERT INTO ventas_detalle (sale_id, product_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?)",
-                [sale_id, product.product_id, product.quantity, product.subtotal, productEarnedPoints]
-            );
-
-            // Actualizar el stock del producto
-            await db.promise().query(
+            // ✅ Descontar stock en producto general
+            await db.query(
                 "UPDATE productos SET quantity = quantity - ? WHERE id = ?",
-                [product.quantity, product.product_id]
+                [quantity, product_id]
+            );
+
+            const puntos = Math.floor(subtotal / 30);
+            totalEarnedPoints += puntos;
+
+            // ✅ Insertar detalle de venta
+            await db.query(
+                "INSERT INTO ventas_detalle (sale_id, product_id, tone_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?, ?)",
+                [sale_id, product_id, tone_id, quantity, subtotal, puntos]
             );
         }
 
-        // Actualizar los puntos ganados en la tabla `ventas`
-        await db.promise().query(
+        // ✅ Actualizar puntos ganados en la venta
+        await db.query(
             "UPDATE ventas SET earned_points = ? WHERE id = ?",
             [totalEarnedPoints, sale_id]
         );
 
-        // Registrar los puntos en historial_puntos si aplica
+        // ✅ Registrar puntos ganados en historial y cliente
         if (totalEarnedPoints > 0 && customer_id !== null) {
-            await db.promise().query(
+            await db.query(
                 "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'earned')",
                 [customer_id, sale_id, totalEarnedPoints]
             );
 
-            // Actualizar los puntos acumulados del cliente
-            await db.promise().query(
+            await db.query(
                 "UPDATE clientes SET accumulated_points = accumulated_points + ? WHERE id = ?",
                 [totalEarnedPoints, customer_id]
             );
         }
 
-        await db.promise().commit();
+        await db.commit();
         res.json({ message: "Venta registrada con éxito" });
+
     } catch (error) {
-        await db.promise().rollback();
-        console.error("Error en el registro de venta:", error);
+        await db.rollback();
+        console.error("❌ Error en el registro de venta:", error);
         res.status(500).json({ error: "Error al registrar la venta" });
     }
 });
+
 // Ruta para cargar las ventas
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
     const query = `
         SELECT
             v.id AS id_venta,
@@ -102,24 +115,24 @@ router.get('/', (req, res) => {
         JOIN usuarios u ON v.user_id = u.id
         LEFT JOIN clientes c ON v.customer_id = c.id
         ORDER BY v.sale_date DESC
-        `
-    db.query(query, (err, results) => {
-        if (err) {
-            res.status(500).send('Error al obtener las ventas');
-        } else {
-            res.status(200).json(results);
-        }
-    })
+    `;
+
+    try {
+        const [results] = await db.query(query);
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error al obtener las ventas:', err);
+        res.status(500).send('Error al obtener las ventas');
+    }
 });
 
 //Obteniendo la factura del cliente
-    // GET /ventas/:id
-    router.get('/:id', async (req, res) => {
-        const { id } = req.params;
+// GET /ventas/:id
+router.get('/:id', async (req, res) => {
+    const { id } = req.params;
 
-        try {
-            // Obtener venta y datos del cliente y usuario
-            const [venta] = await db.promise().query(`
+    try {
+        const [venta] = await db.query(`
             SELECT v.id, v.total, v.sale_date, u.username, 
                    CONCAT(c.first_name, ' ', c.last_name) AS customer
             FROM ventas v
@@ -128,23 +141,31 @@ router.get('/', (req, res) => {
             WHERE v.id = ?
         `, [id]);
 
-            if (!venta.length) return res.status(404).json({ error: 'Venta no encontrada' });
+        if (!venta.length) return res.status(404).json({ error: 'Venta no encontrada' });
 
-            // Obtener detalle de productos
-            const [detalle] = await db.promise().query(`
-            SELECT p.name, vd.quantity, (vd.subtotal / vd.quantity) AS precio_unitario, vd.subtotal
-            FROM ventas_detalle vd
-            JOIN productos p ON vd.product_id = p.id
-            WHERE vd.sale_id = ?
-        `, [id]);
+        const [detalle] = await db.query(`
+    SELECT 
+        p.name AS product_name,
+        p.brand,
+        t.tone_name,
+        vd.quantity,
+        (vd.subtotal / vd.quantity) AS precio_unitario,
+        vd.subtotal
+    FROM ventas_detalle vd
+    JOIN productos p ON vd.product_id = p.id
+    LEFT JOIN tonos t ON vd.tone_id = t.id
+    WHERE vd.sale_id = ?
+`, [id]);
 
-            res.json({
-                venta: venta[0],
-                productos: detalle
-            });
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ error: 'Error al obtener la venta' });
-        }
-    });
+
+        res.json({
+            venta: venta[0],
+            productos: detalle
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al obtener la venta' });
+    }
+});
+
 module.exports = router;

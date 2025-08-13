@@ -1,81 +1,104 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // Importa la conexión correctamente
+const db = require('../config/db'); // Conexión con .promise()
 
-// //RUTA PARA CARGAR CATEGORIAS
-router.get('/', (req, res) => {
-    const query = 'SELECT id, name, description FROM categorias';
-
-    db.query(query, (err, results) => {
-        if (err) {
-            res.status(500).send('Error al obtener categorias');
-        } else {
-            res.status(200).json(results);
-        }
-    });
+// ================================
+// RUTA PARA CARGAR CATEGORÍAS
+// ================================
+router.get('/', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT id, name, description FROM categorias');
+        res.status(200).json(results);
+    } catch (err) {
+        console.error('Error al obtener categorías:', err);
+        res.status(500).send('Error al obtener categorías');
+    }
 });
 
-//RURA PARA AGREGAR UNA NUEVA CATEGORIA
-router.post('/', (req, res) => {
+// ================================
+// RUTA PARA AGREGAR UNA NUEVA CATEGORÍA
+// ================================
+router.post('/', async (req, res) => {
     const { categoryname, categorydescription } = req.body;
 
-    const query = 'INSERT INTO categorias (name, description) VALUES (?, ?)'
-
-    db.query(query, [categoryname, categorydescription], (err, result) => {
-        if (err) {
-            res.status(500).send('Error al agregar la categoria');
-        } else {
-            res.status(201).json({ message: 'Categoria agregada correctamente,', categoryId: result.insertId });
-        }
-    });
+    try {
+        const [result] = await db.query(
+            'INSERT INTO categorias (name, description) VALUES (?, ?)',
+            [categoryname, categorydescription]
+        );
+        res.status(201).json({ 
+            success: true,
+            message: 'Categoría agregada correctamente',
+            categoryId: result.insertId 
+        });
+    } catch (err) {
+        console.error('Error al agregar categoría:', err);
+        res.status(500).send('Error al agregar la categoría');
+    }
 });
 
-//RUTA PARA OBTENER UNA CATEGORIA POR SU ID
-router.get('/:id', (req, res) => {
+// ================================
+// RUTA PARA OBTENER UNA CATEGORÍA POR ID
+// ================================
+router.get('/:id', async (req, res) => {
     const categoryId = req.params.id;
-    const query = 'SELECT id, name, description FROM categorias WHERE id = ?';
 
-    db.query(query, [categoryId], (err, results) => {
-        if (err) {
-            res.status(200).send('Error al obtener categoria');
-        } else if (results.length === 0) {
-            res.status(404).send('Categoria no encontrada');
-        } else {
-            res.status(200).json(results[0]);
+    try {
+        const [results] = await db.query(
+            'SELECT id, name, description FROM categorias WHERE id = ?',
+            [categoryId]
+        );
+
+        if (results.length === 0) {
+            return res.status(404).send('Categoría no encontrada');
         }
-    });
+
+        res.status(200).json(results[0]);
+    } catch (err) {
+        console.error('Error al obtener categoría:', err);
+        res.status(500).send('Error al obtener categoría');
+    }
 });
 
-router.put('/:id', (req, res) => {
+// ================================
+// RUTA PARA ACTUALIZAR CATEGORÍA
+// ================================
+router.put('/:id', async (req, res) => {
     const categoryId = req.params.id;
     const { name, description } = req.body;
 
-    let query = 'UPDATE categorias SET name = ?, description = ?';
+    try {
+        await db.query(
+            'UPDATE categorias SET name = ?, description = ? WHERE id = ?',
+            [name, description, categoryId]
+        );
 
-    const params = [name, description];
+        res.status(200).json({ 
+            success: true,
+            message: 'Categoría actualizada correctamente' 
+        });
+    } catch (err) {
+        console.error('Error al actualizar categoría:', err);
+        res.status(500).send('Error al actualizar categoría');
+    }
+});
 
-    query += ' WHERE id = ?';
-    params.push(categoryId);
-
-    db.query(query, params, (err, result) => {
-        if (err) {
-            res.status(500).send('Error al actualizar categoria');
-        } else {
-            res.status(200).json({ success: true, mesage: 'Categoria actualizada correctamente' })
-        }
-    })
-})
-
+// ================================
+// RUTA PARA ELIMINAR CATEGORÍA
+// ================================
 router.delete('/:id', async (req, res) => {
     const categoryId = req.params.id;
-    const query = 'DELETE FROM categorias WHERE id = ?';
 
-    db.query(query, [categoryId], (err, result) => {
-        if (err) {
-            res.status(500).send('Error al eliminar categoria');
-        } else {
-            res.status(200).json({ success: true, message: 'Categoria eliminado correctamente' });
-        }
-    })
-})
+    try {
+        await db.query('DELETE FROM categorias WHERE id = ?', [categoryId]);
+        res.status(200).json({ 
+            success: true,
+            message: 'Categoría eliminada correctamente' 
+        });
+    } catch (err) {
+        console.error('Error al eliminar categoría:', err);
+        res.status(500).send('Error al eliminar categoría');
+    }
+});
+
 module.exports = router;

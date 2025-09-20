@@ -1,9 +1,9 @@
 const mysql = require('mysql2');
 // Configuración de la conexión a la base de datos MySQL
 const db = mysql.createConnection({
-    host: 'ojcalix.mysql.database.azure.com', // Dirección del servidor de la base de datos (local en este caso)
-    user: 'ojcalix', // Usuario de MySQL (debe ser tu usuario configurado)
-    password: 'Shekelo2025', // Contraseña para el usuario de MySQL
+    host: 'maglev.proxy.rlwy.net', // Dirección del servidor de la base de datos (local en este caso)
+    user: 'root', // Usuario de MySQL (debe ser tu usuario configurado)
+    password: 'xrkMadiTIXlGgprYcljxwqusaScdPXHH', // Contraseña para el usuario de MySQL
     database: 'vansue', // Nombre de la base de datos donde se almacenarán los datos
 }).promise();
 

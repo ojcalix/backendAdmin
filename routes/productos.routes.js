@@ -171,7 +171,7 @@ router.post('/', upload.fields([
                 });
                 //Insertamos en la BD
                 await db.query(
-                    `INSERT INTO producto_imagenes (product_id, image, type) VALUES (?, ?, ?)`,
+                    `INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, ?)`,
                     [productId, extraUpload.secure_url, 'extra']
                 );
             }

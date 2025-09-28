@@ -8,6 +8,7 @@ const { Readable } = require('stream');
 const cloudinary = require('../config/cloudinary');
 const streamifier = require('streamifier');
 const db = require('../config/db'); // Ajusta esta ruta según tu estructura
+const { rejects } = require('assert');
 
 // Configuración de multer (almacenamiento en memoria)
 const storage = multer.memoryStorage();
@@ -27,7 +28,9 @@ function bufferToStream(buffer) {
 // Ruta POST para registrar un producto nuevo, usando multer para recibir imágenes
 router.post('/', upload.fields([
     { name: 'productImage', maxCount: 1 },      // Recibe un archivo con el nombre "productImage" (máximo 1)
-    { name: 'toneImages', maxCount: 20 }        // Recibe archivos con el nombre "toneImages" (máximo 20 tonos)
+    { name: 'hoverImage', maxCount: 1 },
+    { name: 'extraImages', maxCount: 10 },//Imagenes adicionales del producto
+    { name: 'toneImages', maxCount: 20 }      // Recibe archivos con el nombre "toneImages" (máximo 20 tonos)
 ]),
     async (req, res) => {
         try {
@@ -37,6 +40,7 @@ router.post('/', upload.fields([
                 productBrand,           // Marca del producto
                 productCategory,        // ID de la categoría
                 productSubCategory,     // ID de la subcategoría
+                productSubSubCategory,
                 productDescription,     // Descripción del producto
                 salePrice,              // Precio de venta
                 productQuantity,        // Cantidad total (si no hay tonos)
@@ -119,8 +123,8 @@ router.post('/', upload.fields([
             // === Insertar el producto en la base de datos ===
             const insertSql = `
             INSERT INTO productos 
-            (name, brand, description, category_id, subcategory_id, sale_price, quantity, image) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (name, brand, description, category_id, subcategory_id, sub_subcategory_id, sale_price, quantity, image) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
 
             // Ejecuta la consulta SQL con los datos del producto
@@ -130,12 +134,73 @@ router.post('/', upload.fields([
                 productDescription,     // descripción
                 productCategory,        // categoría ID
                 productSubCategory,     // subcategoría ID
+                productSubSubCategory,
                 salePrice,              // precio de venta
                 quantity,               // cantidad general (0 si tiene tonos)
                 imagePath               // URL de la imagen (puede ser null)
             ]);
 
             const productId = insertResult.insertId; // Obtiene el ID generado del producto
+
+            //Guarda imagenes adicionales
+            const extraImages = req.files.extraImages || [];
+
+            for (let i = 0; i < extraImages.length; i++) {
+                const extraFile = extraImages[i];
+
+                //Remidensionamos a 600x800
+                const extraBuffer = await sharp(extraFile.buffer)
+                    .resize(600, 600)
+                    .webp({ quality: 70 })
+                    .toBuffer();
+
+                //Generamos un nombre unico
+                const extraPublicId = `${productName.replace(/\s+/g, '_').toLowerCase()}_extra_${Date.now()}_${i}`;
+
+                //Subimos a cloudinary
+                const extraUpload = await new Promise((resolve, reject) => {
+                    const stream = cloudinary.uploader.upload_stream(
+                        {
+                            folder: 'proyecto_copia/productos_extra',
+                            public_id: extraPublicId,
+                            resource_type: 'image',
+                        },
+                        (err, result) => (err ? reject(err) : resolve(result))
+                    );
+                    bufferToStream(extraBuffer).pipe(stream);
+                });
+                //Insertamos en la BD
+                await db.query(
+                    `INSERT INTO producto_imagenes (product_id, image, type) VALUES (?, ?, ?)`,
+                    [productId, extraUpload.secure_url, 'extra']
+                );
+            }
+
+            //Guardamos imagenes para Hover
+            // === Imagen Hover ===
+            const hoverFile = req.files?.hoverImage?.[0];
+            if (hoverFile) {
+                const hoverBuffer = await sharp(hoverFile.buffer)
+                    .resize(600, 600)
+                    .webp({ quality: 70 })
+                    .toBuffer();
+
+                const hoverPublicId = `${productName.replace(/\s+/g, '_').toLowerCase()}_hover_${Date.now()}`;
+
+                const hoverUpload = await new Promise((resolve, reject) => {
+                    const stream = cloudinary.uploader.upload_stream(
+                        { folder: 'proyecto_copia/productos_hover', public_id: hoverPublicId },
+                        (err, result) => (err ? reject(err) : resolve(result))
+                    );
+                    bufferToStream(hoverBuffer).pipe(stream);
+                });
+
+                await db.query(
+                    `INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, ?)`,
+                    [productId, hoverUpload.secure_url, 'hover']
+                );
+            }
+
 
             // === Insertar código de barras si es perfume ===
             if (perfumeBarcode) {

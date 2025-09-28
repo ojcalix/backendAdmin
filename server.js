@@ -44,6 +44,9 @@ app.use('/categorias', categoriasRoutes);
 const subCategoriasRoutes = require('./routes/subcategorias.routes');
 app.use('/subcategorias', subCategoriasRoutes);
 
+const subSubCategoriasRoutes = require('./routes/subsubcategorias.routes');
+app.use('/subsubcategorias', subSubCategoriasRoutes);
+
 const comprasRoutes = require('./routes/compras.routes');
 app.use('/compras', comprasRoutes);
 

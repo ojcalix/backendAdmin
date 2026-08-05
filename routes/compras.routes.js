@@ -27,37 +27,53 @@ router.post('/', async (req, res) => {
 
         // Insertar detalle de compra y actualizar stock
         for (const product of products) {
-            console.log(`🔍 Producto ID: ${product.product_id}, Tone ID: ${product.tone_id}, Tipo: ${typeof product.tone_id}`);
-
             const toneIdValue = (product.tone_id !== null && product.tone_id !== "" && !isNaN(product.tone_id))
                 ? parseInt(product.tone_id)
                 : null;
 
-            console.log(`➡️ Tone ID procesado:`, toneIdValue);
-
             await db.query(
-                `INSERT INTO detalle_compras (purchase_id, product_id, quantity, purchase_price, tone_id) 
-                 VALUES (?, ?, ?, ?, ?)`,
-                [purchase_id, product.product_id, product.quantity, product.purchase_price, toneIdValue]
+                `INSERT INTO detalle_compras
+        (purchase_id,product_id,quantity,purchase_price,tone_id)
+        VALUES (?,?,?,?,?)`,
+                [
+                    purchase_id,
+                    product.product_id,
+                    product.quantity,
+                    product.purchase_price,
+                    toneIdValue
+                ]
             );
-            console.log(`✅ Detalle insertado para producto ${product.product_id}`);
 
-            // Siempre actualizar tonos si aplica
             if (toneIdValue !== null) {
-                const [updateTone] = await db.query(
-                    `UPDATE tonos SET quantity = quantity + ? WHERE id = ?`,
+
+                await db.query(
+                    `UPDATE tonos
+            SET quantity=quantity+?
+            WHERE id=?`,
                     [product.quantity, toneIdValue]
                 );
-                console.log(`📦 Stock de tono ${toneIdValue} actualizado (+${product.quantity})`, updateTone);
+
+                await db.query(
+                    `UPDATE productos
+            SET quantity=(
+                SELECT COALESCE(SUM(quantity),0)
+                FROM tonos
+                WHERE product_id=?
+            )
+            WHERE id=?`,
+                    [product.product_id, product.product_id]
+                );
+
+            } else {
+
+                await db.query(
+                    `UPDATE productos
+            SET quantity=quantity+?
+            WHERE id=?`,
+                    [product.quantity, product.product_id]
+                );
+
             }
-
-            // Siempre actualizar producto general
-            const [updateProduct] = await db.query(
-                `UPDATE productos SET quantity = quantity + ? WHERE id = ?`,
-                [product.quantity, product.product_id]
-            );
-            console.log(`📦 Stock de producto ${product.product_id} actualizado (+${product.quantity})`, updateProduct);
-
         }
 
         await db.commit();
@@ -109,6 +125,38 @@ router.get('/buscar/:term', async (req, res) => {
     } catch (err) {
         console.error('Error al buscar el proveedor:', err);
         res.status(500).send('Error al buscar el proveedor');
+    }
+});
+
+router.get('/:productId/:supplierId', async (req, res) => {
+    try {
+        const { productId, supplierId } = req.params;
+
+        const [rows] = await db.query(`
+            SELECT
+                pp.purchase_price AS purchasePrice,
+                p.sale_price AS salePrice
+            FROM producto_proveedor pp
+            INNER JOIN productos p
+                ON p.id=pp.product_id
+            WHERE pp.product_id=?
+            AND pp.supplier_id=?
+            LIMIT 1
+        `, [productId, supplierId]);
+
+        if (rows.length === 0) {
+            return res.status(404).json({
+                message: "Este producto no tiene precio de compra registrado para este proveedor."
+            });
+        }
+
+        res.json(rows[0]);
+
+    } catch (err) {
+        console.error("Error al obtener precios:", err);
+        res.status(500).json({
+            message: "Error al obtener los precios."
+        });
     }
 });
 

@@ -38,9 +38,8 @@ router.post('/', upload.fields([
             const {
                 productName,            // Nombre del producto
                 productBrand,           // Marca del producto
-                productCategory,        // ID de la categoría
-                productSubCategory,     // ID de la subcategoría
-                productSubSubCategory,
+                gender_id,
+                inventoryType,
                 productDescription,     // Descripción del producto
                 salePrice,              // Precio de venta
                 productQuantity,        // Cantidad total (si no hay tonos)
@@ -122,22 +121,22 @@ router.post('/', upload.fields([
 
             // === Insertar el producto en la base de datos ===
             const insertSql = `
-            INSERT INTO productos 
-            (name, brand, description, category_id, subcategory_id, sub_subcategory_id, sale_price, quantity, image) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `;
+                INSERT INTO productos 
+                (name, brand, description, category_id, gender_id, sale_price, quantity, inventory_type, image) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `;
 
             // Ejecuta la consulta SQL con los datos del producto
             const [insertResult] = await db.query(insertSql, [
-                productName,            // nombre
-                productBrand,           // marca
-                productDescription,     // descripción
-                productCategory,        // categoría ID
-                productSubCategory,     // subcategoría ID
-                productSubSubCategory,
-                salePrice,              // precio de venta
-                quantity,               // cantidad general (0 si tiene tonos)
-                imagePath               // URL de la imagen (puede ser null)
+                productName,
+                productBrand,
+                productDescription,
+                req.body.category_id,
+                gender_id || null,
+                salePrice,
+                quantity,
+                inventoryType,
+                imagePath
             ]);
 
             const productId = insertResult.insertId; // Obtiene el ID generado del producto
@@ -281,23 +280,39 @@ router.get('/', async (req, res) => {
         const totalPages = Math.ceil(total / limit); // Calcula cuántas páginas en total hay
 
         const [productResults] = await db.query(`
-            SELECT 
-                p.id AS productId,                                
-                p.name AS productName,                            
-                p.brand AS productBrand,                          
-                p.description AS productDescription,              
-                c.name AS productCategory,                  
-                p.sale_price AS salePrice,                      
-                COALESCE(SUM(t.quantity), p.quantity) AS productQuantity, -- Suma la cantidad de tonos si hay, si no usa la cantidad del producto
-                p.image AS productImage,           
-                p.registration_date AS createdAt       
-            FROM productos p
-            LEFT JOIN categorias c ON p.category_id = c.id       
-            LEFT JOIN tonos t ON t.product_id = p.id              
-            GROUP BY p.id                                        
-            ORDER BY p.registration_date DESC                     
-            LIMIT ? OFFSET ?                            
-        `, [limit, offset]);
+    SELECT 
+        p.id AS productId,                                
+        p.name AS productName,                            
+        p.brand AS productBrand,                          
+        p.description AS productDescription,              
+
+        CONCAT_WS(' > ',
+            parent2.name,
+            parent1.name,
+            c.name
+        ) AS productCategory,
+
+        p.sale_price AS salePrice,                      
+
+        COALESCE(SUM(t.quantity), p.quantity) AS productQuantity,
+
+        p.image AS productImage,           
+        p.registration_date AS createdAt       
+
+    FROM productos p
+
+    LEFT JOIN categorias c ON p.category_id = c.id       
+    LEFT JOIN categorias parent1 ON c.parent_id = parent1.id
+    LEFT JOIN categorias parent2 ON parent1.parent_id = parent2.id
+
+    LEFT JOIN tonos t ON t.product_id = p.id              
+
+    GROUP BY p.id                                        
+
+    ORDER BY p.registration_date DESC                     
+
+    LIMIT ? OFFSET ?                            
+`, [limit, offset]);
 
         res.status(200).json({                                     // Devuelve la respuesta en formato JSON con los productos y datos de paginación
             products: productResults,
@@ -313,103 +328,309 @@ router.get('/', async (req, res) => {
 });
 router.get('/todos', async (req, res) => {
     try {
+
         const query = `
-            SELECT 
+            SELECT
+                'product' AS rowType,
+
                 p.id AS productId,
-                GROUP_CONCAT(DISTINCT cb.barcode) AS barCodes, -- varios códigos separados por coma
+                NULL AS toneId,
+                NULL AS toneName,
+
+                GROUP_CONCAT(DISTINCT cb.barcode) AS barCodes,
+
+                p.name AS productName,
+                p.brand AS productBrand,
+                p.description AS productDescription,
+
+                c.name AS productCategory,
+
+                p.inventory_type,
+
+                p.sale_price AS salePrice,
+
+                p.quantity AS productQuantity,
+
+                p.image AS productImage,
+
+                p.registration_date AS createdAt
+
+            FROM productos p
+
+            LEFT JOIN categorias c
+                ON c.id = p.category_id
+
+            LEFT JOIN codigos_barras cb
+                ON cb.product_id = p.id
+                AND cb.tone_id IS NULL
+
+            WHERE p.inventory_type IN ('simple','barcode')
+
+            GROUP BY p.id
+
+            UNION ALL
+
+            SELECT
+                'tone' AS rowType,
+
+                p.id AS productId,
+
+                t.id AS toneId,
+
+                t.tone_name AS toneName,
+
+                cb.barcode AS barCodes,
+
+                p.name AS productName,
+
+                p.brand AS productBrand,
+
+                p.description AS productDescription,
+
+                c.name AS productCategory,
+
+                p.inventory_type,
+
+                p.sale_price AS salePrice,
+
+                t.quantity AS productQuantity,
+
+                t.image AS productImage,
+
+                p.registration_date AS createdAt
+
+            FROM tonos t
+
+            INNER JOIN productos p
+                ON p.id = t.product_id
+
+            INNER JOIN categorias c
+                ON c.id = p.category_id
+
+            LEFT JOIN codigos_barras cb
+                ON cb.tone_id = t.id
+
+            WHERE p.inventory_type='tones'
+
+            ORDER BY productId DESC,toneName ASC
+        `;
+
+        const [results] = await db.query(query);
+
+        res.status(200).json(results);
+
+    } catch (err) {
+
+        console.error("Error al obtener productos:", err);
+
+        res.status(500).send("Error al obtener productos");
+
+    }
+});
+
+router.get('/proveedor/:supplierId', async (req, res) => {
+    try {
+        const { supplierId } = req.params;
+
+        const query = `
+            SELECT
+                p.id AS productId,
                 p.name AS productName,
                 p.brand AS productBrand,
                 p.description AS productDescription,
                 c.name AS productCategory,
                 p.sale_price AS salePrice,
-                
-                -- Sumar cantidad de tonos si existen, si no, usar la cantidad del producto
-                COALESCE(
-                    (SELECT SUM(t.quantity) FROM tonos t WHERE t.product_id = p.id),
-                    p.quantity
-                ) AS productQuantity,
-
+                pp.purchase_price AS purchasePrice,
+                p.inventory_type,
                 p.image AS productImage,
-                p.registration_date AS createdAt
-            FROM productos p
-            LEFT JOIN categorias c ON p.category_id = c.id
-            LEFT JOIN codigos_barras cb ON cb.product_id = p.id
-            GROUP BY p.id
-            ORDER BY p.id DESC
+                COALESCE(
+                    (SELECT SUM(quantity)
+                     FROM tonos
+                     WHERE product_id = p.id),
+                    p.quantity
+                ) AS productQuantity
+            FROM producto_proveedor pp
+            INNER JOIN productos p
+                ON p.id = pp.product_id
+            LEFT JOIN categorias c
+                ON c.id = p.category_id
+            WHERE pp.supplier_id = ?
+            ORDER BY p.name ASC
         `;
 
-        const [results] = await db.query(query);
-        res.status(200).json(results);
-    } catch (err) {
-        console.error('Error al obtener productos:', err);
-        res.status(500).send('Error al obtener productos');
+        const [products] = await db.query(query, [supplierId]);
+
+        res.json(products);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            message: 'Error al obtener los productos del proveedor.'
+        });
+    }
+});
+
+router.get('/tonos/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+
+        const [tones] = await db.query(`
+            SELECT
+                t.id,
+                t.product_id,
+                t.tone_name,
+                t.quantity,
+                t.image,
+                t.status,
+                p.name AS productName,
+                c.name AS productCategory,
+                p.sale_price AS salePrice
+            FROM tonos t
+            INNER JOIN productos p
+                ON p.id = t.product_id
+            LEFT JOIN categorias c
+                ON c.id = p.category_id
+            WHERE t.product_id = ?
+            AND t.status = 'active'
+            ORDER BY t.tone_name ASC
+        `, [productId]);
+
+        res.json(tones);
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({
+            message: "Error al obtener los tonos."
+        });
     }
 });
 
 router.get('/:id', async (req, res) => {
     try {
+
         const productId = req.params.id;
 
-        // Obtener datos principales del producto
-        const [productos] = await db.query(`
-            SELECT 
+        // ===========================
+        // DATOS PRINCIPALES
+        // ===========================
+
+        const [products] = await db.query(`
+            SELECT
                 p.id AS productId,
                 p.name AS productName,
                 p.brand AS productBrand,
                 p.description AS productDescription,
                 p.category_id,
-                p.subcategory_id,
+                p.gender_id,
+                p.inventory_type,
                 p.sale_price AS salePrice,
                 p.quantity AS productQuantity,
                 p.image AS productImage,
-                s.name AS subcategoryName
+                p.status
             FROM productos p
-            JOIN subcategorias s ON p.subcategory_id = s.id
             WHERE p.id = ?
         `, [productId]);
 
-        if (productos.length === 0) {
-            return res.status(404).send('Producto no encontrado');
+        if (products.length === 0) {
+            return res.status(404).send("Producto no encontrado");
         }
 
-        const product = productos[0];
+        const product = products[0];
 
-        // Si es un producto tipo perfume (Hombre/Mujer/Unisex), obtener código de barras único
-        let barcode = null;
-        const [barcodes] = await db.query(`
-            SELECT barcode 
-            FROM codigos_barras 
-            WHERE product_id = ? AND tone_id IS NULL
+        // ===========================
+        // CÓDIGO DE BARRAS GENERAL
+        // ===========================
+
+        let barcode = "";
+
+        const [barcodeResult] = await db.query(`
+            SELECT barcode
+            FROM codigos_barras
+            WHERE product_id=?
+            AND tone_id IS NULL
             LIMIT 1
-        `, [productId]);
+        `,[productId]);
 
-        if (barcodes.length > 0) {
-            barcode = barcodes[0].barcode;
+        if(barcodeResult.length){
+            barcode = barcodeResult[0].barcode;
         }
 
-        // Si es un producto con tonos, obtener tonos
+        // ===========================
+        // TONOS
+        // ===========================
+
         let tones = [];
-        if (['labiales', 'polvos', 'rimel', 'corrector', 'base'].includes(product.subcategoryName.toLowerCase())) {
+
+        if(product.inventory_type === "tones"){
+
             const [toneResults] = await db.query(`
-                SELECT 
-                    t.id, t.tone_name AS name, t.quantity,
-                    cb.barcode, t.image, t.status
+                SELECT
+                    t.id,
+                    t.tone_name AS name,
+                    t.quantity,
+                    t.image,
+                    t.status,
+                    cb.barcode
                 FROM tonos t
-                LEFT JOIN codigos_barras cb ON cb.tone_id = t.id
-                WHERE t.product_id = ?
-            `, [productId]);
+                LEFT JOIN codigos_barras cb
+                    ON cb.tone_id=t.id
+                WHERE t.product_id=?
+                ORDER BY t.id
+            `,[productId]);
 
             tones = toneResults;
+
         }
 
-        res.status(200).json({
+        // ===========================
+        // IMAGEN HOVER
+        // ===========================
+
+        let hoverImage = null;
+
+        const [hoverResult] = await db.query(`
+            SELECT image
+            FROM productos_imagenes
+            WHERE product_id=?
+            AND type='hover'
+            LIMIT 1
+        `,[productId]);
+
+        if(hoverResult.length){
+            hoverImage = hoverResult[0].image;
+        }
+
+        // ===========================
+        // IMÁGENES EXTRA
+        // ===========================
+
+        const [extraImages] = await db.query(`
+            SELECT
+                id,
+                image
+            FROM productos_imagenes
+            WHERE product_id=?
+            AND type='extra'
+            ORDER BY id
+        `,[productId]);
+
+        // ===========================
+        // RESPUESTA
+        // ===========================
+        
+        res.json({
             ...product,
             barcode,
+            hoverImage,
+            extraImages,
             tones
         });
-    } catch (err) {
-        console.error('Error al obtener el producto:', err);
-        res.status(500).send('Error al obtener el producto');
+
+    } catch(err){
+
+        console.error(err);
+        res.status(500).send("Error al obtener el producto");
+
     }
 });
 
@@ -420,8 +641,9 @@ router.put('/:id', upload.any(), async (req, res) => {
         const {
             productName,
             productBrand,
-            productCategory,
-            productSubCategory,
+            category_id,
+            gender_id,
+            inventoryType,
             productDescription,
             salePrice,
             productQuantity,
@@ -432,121 +654,276 @@ router.put('/:id', upload.any(), async (req, res) => {
 
         const deleteToneIds = Array.isArray(req.body.deleteToneIds)
             ? req.body.deleteToneIds
-            : req.body.deleteToneIds ? [req.body.deleteToneIds] : [];
+            : req.body.deleteToneIds
+                ? [req.body.deleteToneIds]
+                : [];
 
-        // === Imagen producto principal
-        let imagePath = null;
-        const [producto] = await db.query('SELECT image FROM productos WHERE id = ?', [productId]);
-        if (producto.length > 0) imagePath = producto[0].image;
+        const [[currentProduct]] = await db.query(
+            `SELECT image FROM productos WHERE id=?`,
+            [productId]
+        );
 
-        const productImageFile = req.files.find(f => f.fieldname === 'productImage');
+        let productImage = currentProduct.image;
+
+        const productImageFile = req.files.find(f => f.fieldname === "productImage");
+
         if (productImageFile) {
-            if (imagePath?.includes('res.cloudinary.com')) {
-                const publicId = imagePath.split('/').pop().split('.')[0];
-                await cloudinary.uploader.destroy(publicId).catch(() => { });
-            }
+            const resized = await sharp(productImageFile.buffer)
+                .resize(400, 400)
+                .webp({ quality: 60 })
+                .toBuffer();
 
-            const resized = await sharp(productImageFile.buffer).resize(400, 400).webp({ quality: 60 }).toBuffer();
-            const publicId = `${productName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}`;
             const uploadResult = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream({
-                    folder: 'proyecto_copia/productos',
-                    public_id: publicId,
-                    resource_type: 'image'
+                    folder: "proyecto_copia/productos",
+                    public_id: `${productName.replace(/\s+/g, "_").toLowerCase()}_${Date.now()}`
                 }, (err, result) => err ? reject(err) : resolve(result));
+
                 bufferToStream(resized).pipe(stream);
             });
-            imagePath = uploadResult.secure_url;
+
+            productImage = uploadResult.secure_url;
         }
 
-        // === Sumar cantidades de tonos si hay tonos
         let totalQuantity = 0;
-        if (tones.length > 0) {
-            for (let tone of tones) {
-                const toneQuantity = parseInt(tone.quantity) || 0;
-                totalQuantity += toneQuantity;
-            }
+
+        if (inventoryType === "tones") {
+            tones.forEach(t => {
+                totalQuantity += Number(t.quantity) || 0;
+            });
         } else {
-            totalQuantity = parseInt(productQuantity) || 0;
+            totalQuantity = Number(productQuantity) || 0;
         }
 
-        // === Actualizar producto con cantidad calculada
         await db.query(`
-    UPDATE productos 
-    SET name=?, brand=?, description=?, category_id=?, subcategory_id=?, sale_price=?, quantity=?, image=? 
-    WHERE id=?
-`, [productName, productBrand, productDescription, productCategory, productSubCategory, salePrice, totalQuantity, imagePath, productId]);
+            UPDATE productos
+            SET
+                name=?,
+                brand=?,
+                description=?,
+                category_id=?,
+                gender_id=?,
+                inventory_type=?,
+                sale_price=?,
+                quantity=?,
+                image=?
+            WHERE id=?
+        `, [
+            productName,
+            productBrand,
+            productDescription,
+            category_id,
+            gender_id || null,
+            inventoryType,
+            salePrice,
+            totalQuantity,
+            productImage,
+            productId
+        ]);
 
+        const hoverImageFile = req.files.find(f => f.fieldname === "hoverImage");
 
-        // === Código de barras perfume
-        await db.query('DELETE FROM codigos_barras WHERE product_id = ? AND tone_id IS NULL', [productId]);
-        if (perfumeBarcode) {
-            await db.query('INSERT INTO codigos_barras (barcode, product_id) VALUES (?, ?)', [perfumeBarcode, productId]);
+        if (hoverImageFile) {
+
+            await db.query(`
+                DELETE FROM productos_imagenes
+                WHERE product_id=?
+                AND type='hover'
+            `,[productId]);
+
+            const resized = await sharp(hoverImageFile.buffer)
+                .resize(400,400)
+                .webp({quality:60})
+                .toBuffer();
+
+            const upload = await new Promise((resolve,reject)=>{
+
+                const stream = cloudinary.uploader.upload_stream({
+                    folder:"proyecto_copia/productos_hover",
+                    public_id:`hover_${Date.now()}`
+                },(err,result)=>err?reject(err):resolve(result));
+
+                bufferToStream(resized).pipe(stream);
+
+            });
+
+            await db.query(`
+                INSERT INTO productos_imagenes(product_id,image,type)
+                VALUES(?,?,?)
+            `,[productId,upload.secure_url,'hover']);
+
         }
 
-        // === Eliminar tonos
-        if (deleteToneIds.length > 0) {
-            await db.query('DELETE FROM tonos WHERE product_id=? AND id IN (?)', [productId, deleteToneIds]);
-            await db.query('DELETE FROM codigos_barras WHERE product_id=? AND tone_id IN (?)', [productId, deleteToneIds]);
-        }
+        const extraImages = req.files.filter(f=>f.fieldname==="extraImages");
 
-        // === Procesar tonos
-        for (let tone of tones) {
-            const toneId = tone.id;
-            const toneName = tone.name;
-            const toneQuantity = parseInt(tone.quantity) || 0;
-            const toneBarcode = tone.barcode;
-            const toneStatus = tone.status || 'active';
+        if(extraImages.length){
 
-            const imageField = `toneImage_${tone.imageIndex}`;
-            const imageFile = req.files.find(f => f.fieldname === imageField);
+            await db.query(`
+                DELETE FROM productos_imagenes
+                WHERE product_id=?
+                AND type='extra'
+            `,[productId]);
 
-            let toneImagePath = null;
-            if (imageFile) {
-                const toneBuffer = await sharp(imageFile.buffer).resize(300, 300).webp({ quality: 60 }).toBuffer();
-                const tonePublicId = `${productName.replace(/\s+/g, '_').toLowerCase()}/${toneName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}`;
+            for(const file of extraImages){
 
-                const upload = await new Promise((resolve, reject) => {
+                const resized = await sharp(file.buffer)
+                    .resize(400,400)
+                    .webp({quality:60})
+                    .toBuffer();
+
+                const upload = await new Promise((resolve,reject)=>{
+
                     const stream = cloudinary.uploader.upload_stream({
-                        folder: 'proyecto_copia/tonos',
-                        public_id: tonePublicId,
-                        resource_type: 'image'
-                    }, (err, result) => err ? reject(err) : resolve(result));
-                    bufferToStream(toneBuffer).pipe(stream);
+                        folder:"proyecto_copia/productos_extra",
+                        public_id:`extra_${Date.now()}_${Math.random()}`
+                    },(err,result)=>err?reject(err):resolve(result));
+
+                    bufferToStream(resized).pipe(stream);
+
                 });
 
-                toneImagePath = upload.secure_url;
-            }
-
-            if (toneId) {
                 await db.query(`
-                    UPDATE tonos 
-                    SET tone_name=?, quantity=?, image=COALESCE(?, image), status=? 
-                    WHERE id=? AND product_id=?
-                `, [toneName, toneQuantity, toneImagePath, toneStatus, toneId, productId]);
+                    INSERT INTO productos_imagenes(product_id,image,type)
+                    VALUES(?,?,?)
+                `,[productId,upload.secure_url,'extra']);
 
-                await db.query('DELETE FROM codigos_barras WHERE tone_id=?', [toneId]);
-                if (toneBarcode) {
-                    await db.query('INSERT INTO codigos_barras (barcode, product_id, tone_id) VALUES (?, ?, ?)', [toneBarcode, productId, toneId]);
-                }
-            } else {
-                const [toneResult] = await db.query(`
-                    INSERT INTO tonos (product_id, tone_name, quantity, image, status) 
-                    VALUES (?, ?, ?, ?, ?)
-                `, [productId, toneName, toneQuantity, toneImagePath, toneStatus]);
-
-                const newToneId = toneResult.insertId;
-                if (toneBarcode) {
-                    await db.query('INSERT INTO codigos_barras (barcode, product_id, tone_id) VALUES (?, ?, ?)', [toneBarcode, productId, newToneId]);
-                }
             }
+
         }
 
-        res.status(200).send('Producto actualizado correctamente');
+        await db.query(
+            `DELETE FROM codigos_barras WHERE product_id=? AND tone_id IS NULL`,
+            [productId]
+        );
+
+        if (inventoryType === "barcode" && perfumeBarcode) {
+            await db.query(`
+                INSERT INTO codigos_barras(barcode,product_id)
+                VALUES(?,?)
+            `,[perfumeBarcode,productId]);
+        }
+
+        if (deleteToneIds.length) {
+
+            await db.query(`
+                DELETE FROM tonos
+                WHERE id IN (?)
+            `,[deleteToneIds]);
+
+            await db.query(`
+                DELETE FROM codigos_barras
+                WHERE tone_id IN (?)
+            `,[deleteToneIds]);
+
+        }
+
+        for(const tone of tones){
+
+            let toneImage = null;
+
+            const imageFile = req.files.find(
+                f=>f.fieldname===`toneImage_${tone.imageIndex}`
+            );
+
+            if(imageFile){
+
+                const resized = await sharp(imageFile.buffer)
+                    .resize(300,300)
+                    .webp({quality:60})
+                    .toBuffer();
+
+                const upload = await new Promise((resolve,reject)=>{
+
+                    const stream = cloudinary.uploader.upload_stream({
+                        folder:"proyecto_copia/tonos",
+                        public_id:`${tone.name}_${Date.now()}`
+                    },(err,result)=>err?reject(err):resolve(result));
+
+                    bufferToStream(resized).pipe(stream);
+
+                });
+
+                toneImage = upload.secure_url;
+
+            }
+
+            if(tone.id){
+
+                await db.query(`
+                    UPDATE tonos
+                    SET
+                        tone_name=?,
+                        quantity=?,
+                        image=COALESCE(?,image),
+                        status=?
+                    WHERE id=?
+                `,[
+                    tone.name,
+                    tone.quantity,
+                    toneImage,
+                    tone.status,
+                    tone.id
+                ]);
+
+                await db.query(
+                    `DELETE FROM codigos_barras WHERE tone_id=?`,
+                    [tone.id]
+                );
+
+                if(tone.barcode){
+
+                    await db.query(`
+                        INSERT INTO codigos_barras(barcode,product_id,tone_id)
+                        VALUES(?,?,?)
+                    `,[
+                        tone.barcode,
+                        productId,
+                        tone.id
+                    ]);
+
+                }
+
+            }else{
+
+                const [insertTone]=await db.query(`
+                    INSERT INTO tonos(
+                        product_id,
+                        tone_name,
+                        quantity,
+                        image,
+                        status
+                    )
+                    VALUES(?,?,?,?,?)
+                `,[
+                    productId,
+                    tone.name,
+                    tone.quantity,
+                    toneImage,
+                    tone.status
+                ]);
+
+                if(tone.barcode){
+
+                    await db.query(`
+                        INSERT INTO codigos_barras(barcode,product_id,tone_id)
+                        VALUES(?,?,?)
+                    `,[
+                        tone.barcode,
+                        productId,
+                        insertTone.insertId
+                    ]);
+
+                }
+
+            }
+
+        }
+
+        res.status(200).send("Producto actualizado correctamente");
 
     } catch (err) {
-        console.error('Error al actualizar producto:', err);
-        res.status(500).send('Error al actualizar el producto');
+        console.error(err);
+        res.status(500).send("Error al actualizar el producto");
     }
 });
 

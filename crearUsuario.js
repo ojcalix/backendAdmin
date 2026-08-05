@@ -3,10 +3,10 @@ const mysql = require('mysql2/promise'); // Usamos mysql2 con promesas
 
 // Configurar la conexión a la base de datos
 const db = mysql.createPool({
-    host: 'maglev.proxy.rlwy.net', // Dirección del servidor de la base de datos (local en este caso)
-    port: 55731,
+    host: '127.0.0.1', // Dirección del servidor de la base de datos (local en este caso)
+    port: 3306,
     user: 'root', // Usuario de MySQL (debe ser tu usuario configurado)
-    password: 'xrkMadiTIXlGgprYcljxwqusaScdPXHH', // Contraseña para el usuario de MySQL
+    password: '', // Contraseña para el usuario de MySQL
     database: 'vansue', // Nombre de la base de datos donde se almacenarán los datos
 });
 

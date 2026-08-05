@@ -6,19 +6,48 @@ const db = require('../config/db'); // conexión mysql2/promise
 router.post('/', async (req, res) => {
     try {
         const { product_id, supplier_id, purchase_price } = req.body;
-        const query = 'INSERT INTO producto_proveedor (product_id, supplier_id, purchase_price) VALUES (?, ?, ?)';
-        
-        const [result] = await db.query(query, [product_id, supplier_id, purchase_price]);
-        
+
+        // 1️⃣ Verificar si ya existe la combinación
+        const checkQuery = `
+            SELECT id 
+            FROM producto_proveedor 
+            WHERE product_id = ? AND supplier_id = ?
+            LIMIT 1
+        `;
+
+        const [existing] = await db.query(checkQuery, [product_id, supplier_id]);
+
+        if (existing.length > 0) {
+            return res.status(409).json({
+                message: 'Este producto ya está asociado a este proveedor'
+            });
+        }
+
+        // 2️⃣ Insertar si no existe
+        const insertQuery = `
+            INSERT INTO producto_proveedor (product_id, supplier_id, purchase_price)
+            VALUES (?, ?, ?)
+        `;
+
+        const [result] = await db.query(insertQuery, [
+            product_id,
+            supplier_id,
+            purchase_price
+        ]);
+
         res.status(201).json({
             message: 'Producto con su proveedor agregado correctamente',
             product_supplierId: result.insertId
         });
+
     } catch (err) {
         console.error('Error al ingresar el producto con su proveedor:', err);
-        res.status(500).send('Error al ingresar el producto con su proveedor');
+        res.status(500).json({
+            message: 'Error interno del servidor'
+        });
     }
 });
+
 
 // Obtener todos los productos con sus proveedores y precios
 router.get('/', async (req, res) => {

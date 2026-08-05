@@ -41,12 +41,6 @@ app.use('/proveedores', proveedoresRoutes);
 const categoriasRoutes = require('./routes/categorias.routes');
 app.use('/categorias', categoriasRoutes);
 
-const subCategoriasRoutes = require('./routes/subcategorias.routes');
-app.use('/subcategorias', subCategoriasRoutes);
-
-const subSubCategoriasRoutes = require('./routes/subsubcategorias.routes');
-app.use('/subsubcategorias', subSubCategoriasRoutes);
-
 const comprasRoutes = require('./routes/compras.routes');
 app.use('/compras', comprasRoutes);
 
@@ -59,6 +53,9 @@ app.use('/productos', productosRoutes);
 const clientesRoutes = require('./routes/clientes.routes');
 //const { request } = require('http');
 app.use('/clientes', clientesRoutes);
+
+const generosRoutes = require('./routes/generos');
+app.use('/generos', generosRoutes);
 
 const producto_proveedorRouter = require('./routes/producto_proveedor.routes');
 app.use('/producto_proveedor', producto_proveedorRouter);

@@ -1,102 +1,174 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // Conexión con .promise()
+const db = require('../config/db');
 
 // ================================
-// RUTA PARA CARGAR CATEGORÍAS
+// GET TODAS LAS CATEGORÍAS
 // ================================
 router.get('/', async (req, res) => {
     try {
-        const [results] = await db.query('SELECT id, name, description FROM categorias');
-        res.status(200).json(results);
+        const [results] = await db.query(
+            'SELECT id, name, description, parent_id FROM categorias'
+        );
+        res.json(results);
     } catch (err) {
-        console.error('Error al obtener categorías:', err);
+        console.error(err);
         res.status(500).send('Error al obtener categorías');
     }
 });
 
 // ================================
-// RUTA PARA AGREGAR UNA NUEVA CATEGORÍA
+// CREAR CATEGORÍA
 // ================================
 router.post('/', async (req, res) => {
-    const { categoryname, categorydescription } = req.body;
+
+    console.log("🔥 POST /categorias EJECUTADO");
+
+    const { categoryname, categorydescription, parent_id } = req.body;
+
+    console.log("DATOS RECIBIDOS:", {
+        categoryname,
+        categorydescription,
+        parent_id,
+    });
 
     try {
+
         const [result] = await db.query(
-            'INSERT INTO categorias (name, description) VALUES (?, ?)',
-            [categoryname, categorydescription]
+            `
+INSERT INTO categorias
+(name, description, parent_id)
+VALUES (?, ?, ?)
+`,
+            [
+                categoryname,
+                categorydescription,
+                parent_id || null
+            ]);
+
+        console.log("INSERT RESULT:");
+        console.log(result);
+
+        const [verify] = await db.query(
+            'SELECT * FROM categorias WHERE id = ?',
+            [result.insertId]
         );
-        res.status(201).json({ 
+
+        console.log("REGISTRO CREADO:");
+        console.log(verify);
+
+        res.status(201).json({
             success: true,
-            message: 'Categoría agregada correctamente',
-            categoryId: result.insertId 
+            data: verify
         });
+
     } catch (err) {
-        console.error('Error al agregar categoría:', err);
-        res.status(500).send('Error al agregar la categoría');
+        console.error(err);
+        res.status(500).send(err);
     }
 });
 
 // ================================
-// RUTA PARA OBTENER UNA CATEGORÍA POR ID
+// GET POR ID
 // ================================
 router.get('/:id', async (req, res) => {
-    const categoryId = req.params.id;
+    const id = req.params.id;
 
     try {
         const [results] = await db.query(
-            'SELECT id, name, description FROM categorias WHERE id = ?',
-            [categoryId]
+            `SELECT
+    id,
+    name,
+    description,
+    parent_id
+FROM categorias
+WHERE id = ?`
+            [id]
         );
 
         if (results.length === 0) {
             return res.status(404).send('Categoría no encontrada');
         }
 
-        res.status(200).json(results[0]);
+        res.json(results[0]);
+
     } catch (err) {
-        console.error('Error al obtener categoría:', err);
+        console.error(err);
         res.status(500).send('Error al obtener categoría');
     }
 });
 
 // ================================
-// RUTA PARA ACTUALIZAR CATEGORÍA
+// ACTUALIZAR
 // ================================
 router.put('/:id', async (req, res) => {
-    const categoryId = req.params.id;
-    const { name, description } = req.body;
+    const id = req.params.id;
+    const { name, description, parent_id } = req.body;
 
     try {
+        // ❌ evitar que sea su propio padre
+        if (parent_id && parent_id == id) {
+            return res.status(400).json({
+                error: 'Una categoría no puede ser su propio padre'
+            });
+        }
+
+        // validar que el padre exista
+        if (parent_id) {
+            const [parent] = await db.query(
+                'SELECT id FROM categorias WHERE id = ?',
+                [parent_id]
+            );
+
+            if (parent.length === 0) {
+                return res.status(400).json({
+                    error: 'Categoría padre no válida'
+                });
+            }
+        }
+
         await db.query(
-            'UPDATE categorias SET name = ?, description = ? WHERE id = ?',
-            [name, description, categoryId]
+            `UPDATE categorias
+     SET
+        name = ?,
+        description = ?,
+        parent_id = ?
+     WHERE id = ?`,
+            [
+                name,
+                description,
+                parent_id || null,
+                id
+            ]
         );
 
-        res.status(200).json({ 
+        res.json({
             success: true,
-            message: 'Categoría actualizada correctamente' 
+            message: 'Categoría actualizada'
         });
+
     } catch (err) {
-        console.error('Error al actualizar categoría:', err);
+        console.error(err);
         res.status(500).send('Error al actualizar categoría');
     }
 });
 
 // ================================
-// RUTA PARA ELIMINAR CATEGORÍA
+// ELIMINAR
 // ================================
 router.delete('/:id', async (req, res) => {
-    const categoryId = req.params.id;
+    const id = req.params.id;
 
     try {
-        await db.query('DELETE FROM categorias WHERE id = ?', [categoryId]);
-        res.status(200).json({ 
+        await db.query('DELETE FROM categorias WHERE id = ?', [id]);
+
+        res.json({
             success: true,
-            message: 'Categoría eliminada correctamente' 
+            message: 'Categoría eliminada'
         });
+
     } catch (err) {
-        console.error('Error al eliminar categoría:', err);
+        console.error(err);
         res.status(500).send('Error al eliminar categoría');
     }
 });

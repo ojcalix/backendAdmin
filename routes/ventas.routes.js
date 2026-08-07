@@ -4,22 +4,71 @@ const db = require('../config/db'); // Importa la conexión correctamente
 
 // Ruta para agregar una nueva venta
 router.post('/', async (req, res) => {
-    const { user_id, customer_id, total, earned_points, products } = req.body;
+    const {
+        user_id,
+        customer_id,
+        payment_type,
+        payment_status,
+        total,
+        paid_amount,
+        pending_amount,
+        earned_points,
+        products
+    } = req.body;
 
     if (!user_id || !products.length) {
         return res.status(400).json({ error: "Datos incompletos." });
     }
 
+    const validPaymentTypes = ['cash', 'credit', 'mixed'];
+    if (!validPaymentTypes.includes(payment_type)) {
+        return res.status(400).json({ error: "Forma de pago inválida." });
+    }
+
+    if ((payment_type === 'credit' || payment_type === 'mixed') && !customer_id) {
+        return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
+    }
+
     try {
-        // ✅ Iniciar transacción
         await db.beginTransaction();
+
+        // ✅ Si entra efectivo (cash o mixed con paid_amount > 0), exigir caja abierta
+        let cajaAbierta = null;
+        if ((payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0) {
+            const [cajaResult] = await db.query(
+                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
+                [user_id]
+            );
+
+            if (!cajaResult.length) {
+                await db.rollback();
+                return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas en efectivo." });
+            }
+
+            cajaAbierta = cajaResult[0];
+        }
 
         // ✅ Insertar venta
         const [ventaResult] = await db.query(
-            "INSERT INTO ventas (user_id, customer_id, total, earned_points) VALUES (?, ?, ?, ?)",
-            [user_id, customer_id, total, earned_points]
+            `INSERT INTO ventas 
+                (user_id, customer_id, payment_type, payment_status, total, paid_amount, pending_amount, earned_points) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [user_id, customer_id, payment_type, payment_status, total, paid_amount, pending_amount, earned_points]
         );
         const sale_id = ventaResult.insertId;
+
+        // ✅ Registrar movimiento de caja si aplica
+        if (cajaAbierta) {
+            const concept = payment_type === 'cash'
+                ? `Venta #${sale_id} (contado)`
+                : `Venta #${sale_id} (abono inicial - mixto)`;
+
+            await db.query(
+                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                 VALUES (?, 'income', ?, ?, 'venta', ?)`,
+                [cajaAbierta.id, concept, paid_amount, sale_id]
+            );
+        }
 
         let totalEarnedPoints = 0;
 
@@ -27,7 +76,6 @@ router.post('/', async (req, res) => {
             const { product_id, tone_id, quantity, subtotal } = product;
 
             if (tone_id) {
-                // ✅ Verificar stock en tonos
                 const [toneStockResult] = await db.query(
                     "SELECT quantity FROM tonos WHERE id = ?",
                     [tone_id]
@@ -38,14 +86,12 @@ router.post('/', async (req, res) => {
                     return res.status(400).json({ error: `Stock insuficiente o tono no encontrado (ID: ${tone_id})` });
                 }
 
-                // ✅ Descontar stock en tonos
                 await db.query(
                     "UPDATE tonos SET quantity = quantity - ? WHERE id = ?",
                     [quantity, tone_id]
                 );
             }
 
-            // ✅ Verificar stock en producto general
             const [stockResult] = await db.query(
                 "SELECT quantity FROM productos WHERE id = ?",
                 [product_id]
@@ -56,7 +102,6 @@ router.post('/', async (req, res) => {
                 return res.status(400).json({ error: `Stock insuficiente o producto no encontrado (ID: ${product_id})` });
             }
 
-            // ✅ Descontar stock en producto general
             await db.query(
                 "UPDATE productos SET quantity = quantity - ? WHERE id = ?",
                 [quantity, product_id]
@@ -65,20 +110,17 @@ router.post('/', async (req, res) => {
             const puntos = Math.floor(subtotal / 30);
             totalEarnedPoints += puntos;
 
-            // ✅ Insertar detalle de venta
             await db.query(
                 "INSERT INTO ventas_detalle (sale_id, product_id, tone_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?, ?)",
                 [sale_id, product_id, tone_id, quantity, subtotal, puntos]
             );
         }
 
-        // ✅ Actualizar puntos ganados en la venta
         await db.query(
             "UPDATE ventas SET earned_points = ? WHERE id = ?",
             [totalEarnedPoints, sale_id]
         );
 
-        // ✅ Registrar puntos ganados en historial y cliente
         if (totalEarnedPoints > 0 && customer_id !== null) {
             await db.query(
                 "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'earned')",
@@ -92,7 +134,7 @@ router.post('/', async (req, res) => {
         }
 
         await db.commit();
-        res.json({ message: "Venta registrada con éxito" });
+        res.json({ message: "Venta registrada con éxito", sale_id });
 
     } catch (error) {
         await db.rollback();

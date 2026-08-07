@@ -54,11 +54,27 @@ const clientesRoutes = require('./routes/clientes.routes');
 //const { request } = require('http');
 app.use('/clientes', clientesRoutes);
 
-const generosRoutes = require('./routes/generos');
+const generosRoutes = require('./routes/generos.routes');
 app.use('/generos', generosRoutes);
 
 const producto_proveedorRouter = require('./routes/producto_proveedor.routes');
 app.use('/producto_proveedor', producto_proveedorRouter);
+
+const cuentasPorCobrarRoutes = require('./routes/cuentasPorCobrar.routes');
+app.use('/cuentas-por-cobrar', cuentasPorCobrarRoutes);
+
+const cajaRoutes = require('./routes/caja.routes');
+app.use('/caja', cajaRoutes);
+
+const gastosRoutes = require('./routes/gastos.routes');
+app.use('/gastos', gastosRoutes);
+
+const cuentasPorPagarRoutes = require('./routes/cuentasPorPagar.routes');
+app.use('/cuentas-por-pagar', cuentasPorPagarRoutes);
+
+const bancosRoutes = require('./routes/bancos.routes');
+app.use('/bancos', bancosRoutes);
+
 //para que UptimeRobot no dispare funciones pesadas en el API
 app.get('/ping', (req, res) => {
   res.status(200).json({ message: 'pong' });

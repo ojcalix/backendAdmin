@@ -4,26 +4,84 @@ const db = require('../config/db'); // Importa la conexión correctamente
 const { route } = require('./productos.routes');
 
 // Ruta para hacer el insert de compra de productos
-// Ruta para hacer el insert de compra de productos
 router.post('/', async (req, res) => {
-    const { supplier_id, user_id, purchase_price, products } = req.body;
+    const {
+        supplier_id,
+        user_id,
+        payment_type,
+        payment_status,
+        purchase_price,
+        paid_amount,
+        pending_amount,
+        products
+    } = req.body;
+
+    const validPaymentTypes = ['cash', 'credit', 'mixed'];
+    if (!validPaymentTypes.includes(payment_type)) {
+        return res.status(400).json({ error: "Forma de pago inválida." });
+    }
 
     try {
-        console.log("🛠 DEBUG DATOS DE COMPRA:");
-        console.log("Proveedor:", supplier_id);
-        console.log("Usuario:", user_id);
-        console.log("Precio total:", purchase_price);
-        console.log("Productos recibidos:", JSON.stringify(products, null, 2));
-
         await db.beginTransaction();
+
+        // ✅ Si entra efectivo (cash o mixed con paid_amount > 0), exigir caja abierta y validar saldo
+        let cajaAbierta = null;
+        if ((payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0) {
+            const [cajaResult] = await db.query(
+                "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
+                [user_id]
+            );
+
+            if (!cajaResult.length) {
+                await db.rollback();
+                return res.status(400).json({ error: "Debes abrir tu caja antes de registrar compras en efectivo." });
+            }
+
+            cajaAbierta = cajaResult[0];
+
+            // ✅ Validar saldo disponible en caja
+            const [movResult] = await db.query(
+                `SELECT 
+                    COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
+                    COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
+                 FROM movimientos_caja WHERE caja_id = ?`,
+                [cajaAbierta.id]
+            );
+
+            const availableCash = parseFloat(cajaAbierta.opening_amount)
+                + parseFloat(movResult[0].total_income)
+                - parseFloat(movResult[0].total_expense);
+
+            if (parseFloat(paid_amount) > availableCash) {
+                await db.rollback();
+                return res.status(400).json({
+                    error: `Saldo insuficiente en caja. Disponible: L. ${availableCash.toFixed(2)}`
+                });
+            }
+        }
 
         // Insertar compra
         const [compraResult] = await db.query(
-            `INSERT INTO compras (supplier_id, user_id, purchase_price) VALUES (?, ?, ?)`,
-            [supplier_id, user_id, purchase_price]
+            `INSERT INTO compras 
+                (supplier_id, user_id, payment_type, payment_status, purchase_price, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, purchase_price, paid_amount, pending_amount]
         );
         const purchase_id = compraResult.insertId;
         console.log("✅ Compra insertada con ID:", purchase_id);
+
+        // ✅ Registrar movimiento de caja (egreso) si aplica
+        if (cajaAbierta) {
+            const concept = payment_type === 'cash'
+                ? `Compra #${purchase_id} (contado)`
+                : `Compra #${purchase_id} (abono inicial - mixto)`;
+
+            await db.query(
+                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                 VALUES (?, 'expense', ?, ?, 'compra', ?)`,
+                [cajaAbierta.id, concept, paid_amount, purchase_id]
+            );
+        }
 
         // Insertar detalle de compra y actualizar stock
         for (const product of products) {
@@ -77,7 +135,7 @@ router.post('/', async (req, res) => {
         }
 
         await db.commit();
-        res.json({ message: "Compra realizada con éxito" });
+        res.json({ message: "Compra realizada con éxito", purchase_id });
 
     } catch (error) {
         await db.rollback();

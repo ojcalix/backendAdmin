@@ -35,7 +35,17 @@ router.post('/', async (req, res) => {
             { expiresIn: '1h' }
         );
 
-        res.status(200).json({ success: true, message: 'Inicio de sesión exitoso', token });
+        // ✅ Devolver también los datos del usuario (sin la contraseña)
+        res.status(200).json({
+            success: true,
+            message: 'Inicio de sesión exitoso',
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                role: user.role
+            }
+        });
 
     } catch (err) {
         console.error('Error en el login:', err);

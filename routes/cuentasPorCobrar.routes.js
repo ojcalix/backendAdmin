@@ -1,6 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { crearAsiento } = require('../helpers/contabilidad');
+
 
 // ========================
 // GET /cuentas-por-cobrar
@@ -189,7 +191,19 @@ router.post('/pago', async (req, res) => {
              WHERE id = ?`,
             [newPaidAmount, newPendingAmount, newStatus, sale_id]
         );
+        // ✅ Generar asiento contable
+        const cuentaDestino = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
 
+        await crearAsiento(db, {
+            description: `Abono a factura #${sale_id}`,
+            reference_type: 'pago_credito',
+            reference_id: pagoResult.insertId,
+            user_id,
+            lines: [
+                { code: cuentaDestino, debit: amount }, // Caja o Bancos
+                { code: '1103', credit: amount }        // Cuentas por Cobrar
+            ]
+        });
         await db.commit();
         res.json({
             message: "Abono registrado con éxito",

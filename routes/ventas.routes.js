@@ -1,14 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db'); // Importa la conexión correctamente
-
+const { crearAsiento } = require('../helpers/contabilidad');
 // Ruta para agregar una nueva venta
+
 router.post('/', async (req, res) => {
     const {
         user_id,
         customer_id,
         payment_type,
         payment_status,
+        payment_method,
+        bank_id,
         total,
         paid_amount,
         pending_amount,
@@ -29,12 +32,25 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
     }
 
+    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+
+    if (entraDinero) {
+        const validMethods = ['cash', 'transfer', 'card'];
+        if (!validMethods.includes(payment_method)) {
+            return res.status(400).json({ error: "Método de pago inválido." });
+        }
+        if ((payment_method === 'transfer' || payment_method === 'card') && !bank_id) {
+            return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
+        }
+    }
+
     try {
         await db.beginTransaction();
 
-        // ✅ Si entra efectivo (cash o mixed con paid_amount > 0), exigir caja abierta
         let cajaAbierta = null;
-        if ((payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0) {
+        let bankAccount = null;
+
+        if (entraDinero && payment_method === 'cash') {
             const [cajaResult] = await db.query(
                 "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
                 [user_id]
@@ -48,16 +64,30 @@ router.post('/', async (req, res) => {
             cajaAbierta = cajaResult[0];
         }
 
+        if (entraDinero && (payment_method === 'transfer' || payment_method === 'card')) {
+            const [bankResult] = await db.query(
+                "SELECT id FROM bancos WHERE id = ? AND status = 'active'",
+                [bank_id]
+            );
+
+            if (!bankResult.length) {
+                await db.rollback();
+                return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
+            }
+
+            bankAccount = bankResult[0];
+        }
+
         // ✅ Insertar venta
         const [ventaResult] = await db.query(
             `INSERT INTO ventas 
-                (user_id, customer_id, payment_type, payment_status, total, paid_amount, pending_amount, earned_points) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [user_id, customer_id, payment_type, payment_status, total, paid_amount, pending_amount, earned_points]
+                (user_id, customer_id, payment_type, payment_status, payment_method, bank_id, total, paid_amount, pending_amount, earned_points) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [user_id, customer_id, payment_type, payment_status, payment_method || 'cash', bank_id || null, total, paid_amount, pending_amount, earned_points]
         );
         const sale_id = ventaResult.insertId;
 
-        // ✅ Registrar movimiento de caja si aplica
+        // ✅ Registrar movimiento de caja si el pago fue en efectivo
         if (cajaAbierta) {
             const concept = payment_type === 'cash'
                 ? `Venta #${sale_id} (contado)`
@@ -67,6 +97,24 @@ router.post('/', async (req, res) => {
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'income', ?, ?, 'venta', ?)`,
                 [cajaAbierta.id, concept, paid_amount, sale_id]
+            );
+        }
+
+        // ✅ Registrar movimiento bancario si el pago fue transferencia/tarjeta
+        if (bankAccount) {
+            const concept = payment_type === 'cash'
+                ? `Venta #${sale_id} (contado)`
+                : `Venta #${sale_id} (abono inicial - mixto)`;
+
+            await db.query(
+                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'transfer_in', ?, ?, 'venta', ?)`,
+                [bank_id, paid_amount, concept, sale_id]
+            );
+
+            await db.query(
+                "UPDATE bancos SET current_balance = current_balance + ? WHERE id = ?",
+                [paid_amount, bank_id]
             );
         }
 
@@ -132,6 +180,26 @@ router.post('/', async (req, res) => {
                 [totalEarnedPoints, customer_id]
             );
         }
+
+        // ✅ Generar asiento contable
+        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+
+        const lines = [{ code: '4101', credit: total }]; // Ventas
+
+        if (paid_amount > 0) {
+            lines.push({ code: cuentaDinero, debit: paid_amount });
+        }
+        if (pending_amount > 0) {
+            lines.push({ code: '1103', debit: pending_amount }); // Cuentas por Cobrar
+        }
+
+        await crearAsiento(db, {
+            description: `Venta #${sale_id}`,
+            reference_type: 'venta',
+            reference_id: sale_id,
+            user_id,
+            lines
+        });
 
         await db.commit();
         res.json({ message: "Venta registrada con éxito", sale_id });

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /caja/actual?user_id=X
@@ -145,7 +146,7 @@ router.post('/cerrar', async (req, res) => {
                 );
 
                 if (categoryResult.length) {
-                    await db.query(
+                    const [gastoInsert] = await db.query(
                         `INSERT INTO gastos (category_id, concept, amount, payment_method, caja_id, user_id) 
                          VALUES (?, ?, ?, 'cash', ?, ?)`,
                         [
@@ -156,12 +157,24 @@ router.post('/cerrar', async (req, res) => {
                             caja.user_id
                         ]
                     );
+
+                    // ✅ Asiento contable del faltante
+                    await crearAsiento(db, {
+                        description: `Faltante de caja al cierre #${caja_id}`,
+                        reference_type: 'ajuste',
+                        reference_id: gastoInsert.insertId,
+                        user_id: caja.user_id,
+                        lines: [
+                            { code: '6101', debit: Math.abs(difference) }, // Gastos Generales
+                            { code: '1101', credit: Math.abs(difference) } // Caja
+                        ]
+                    });
                 }
             } else {
                 // Sobrante → se registra como ingreso extra
-                await db.query(
-                    `INSERT INTO ingresos_extra (concept, amount, payment_method, caja_id, user_id) 
-                     VALUES (?, ?, 'cash', ?, ?)`,
+                const [ingresoInsert] = await db.query(
+                    `INSERT INTO ingresos_extra (concept, amount, payment_method, caja_id, user_id, is_system) 
+                     VALUES (?, ?, 'cash', ?, ?, TRUE)`,
                     [
                         `Sobrante de caja al cierre #${caja_id}`,
                         difference,
@@ -169,6 +182,18 @@ router.post('/cerrar', async (req, res) => {
                         caja.user_id
                     ]
                 );
+
+                // ✅ Asiento contable del sobrante
+                await crearAsiento(db, {
+                    description: `Sobrante de caja al cierre #${caja_id}`,
+                    reference_type: 'ajuste',
+                    reference_id: ingresoInsert.insertId,
+                    user_id: caja.user_id,
+                    lines: [
+                        { code: '1101', debit: difference },  // Caja
+                        { code: '4102', credit: difference }  // Otros Ingresos
+                    ]
+                });
             }
         }
 

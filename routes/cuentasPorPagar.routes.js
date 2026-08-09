@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /cuentas-por-pagar
@@ -214,6 +215,20 @@ router.post('/pago', async (req, res) => {
              WHERE id = ?`,
             [newPaidAmount, newPendingAmount, newStatus, purchase_id]
         );
+
+        // ✅ Generar asiento contable
+        const cuentaOrigen = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+
+        await crearAsiento(db, {
+            description: `Pago a proveedor - Compra #${purchase_id}`,
+            reference_type: 'pago_proveedor',
+            reference_id: pagoResult.insertId,
+            user_id,
+            lines: [
+                { code: '2101', debit: amount },      // Cuentas por Pagar
+                { code: cuentaOrigen, credit: amount } // Caja o Bancos
+            ]
+        });
 
         await db.commit();
         res.json({

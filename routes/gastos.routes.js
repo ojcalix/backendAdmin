@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /gastos/categorias
@@ -175,6 +176,20 @@ router.post('/', async (req, res) => {
                 [amount, bank_id]
             );
         }
+
+        // ✅ Generar asiento contable
+        const cuentaOrigen = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+
+        await crearAsiento(db, {
+            description: `Gasto: ${concept}`,
+            reference_type: 'gasto',
+            reference_id: gastoResult.insertId,
+            user_id,
+            lines: [
+                { code: '6101', debit: amount },       // Gastos Generales
+                { code: cuentaOrigen, credit: amount } // Caja o Bancos
+            ]
+        });
 
         await db.commit();
         res.json({ message: "Gasto registrado con éxito", gasto_id: gastoResult.insertId });

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../config/db'); // Importa la conexión correctamente
 const { route } = require('./productos.routes');
+const { crearAsiento } = require('../helpers/contabilidad');
 
 // Ruta para hacer el insert de compra de productos
 router.post('/', async (req, res) => {
@@ -133,7 +134,25 @@ router.post('/', async (req, res) => {
 
             }
         }
+        // ✅ Generar asiento contable
+        const cuentaCaja = payment_type === 'cash' || payment_type === 'mixed' ? '1101' : null;
 
+        const lines = [{ code: '1104', debit: purchase_price }]; // Inventario
+
+        if (paid_amount > 0 && cuentaCaja) {
+            lines.push({ code: cuentaCaja, credit: paid_amount }); // Caja
+        }
+        if (pending_amount > 0) {
+            lines.push({ code: '2101', credit: pending_amount }); // Cuentas por Pagar
+        }
+
+        await crearAsiento(db, {
+            description: `Compra #${purchase_id}`,
+            reference_type: 'compra',
+            reference_id: purchase_id,
+            user_id,
+            lines
+        });
         await db.commit();
         res.json({ message: "Compra realizada con éxito", purchase_id });
 

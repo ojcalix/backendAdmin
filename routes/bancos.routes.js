@@ -110,14 +110,13 @@ router.post('/movimiento-manual', async (req, res) => {
         return res.status(400).json({ error: "Tipo de movimiento inválido." });
     }
 
-    if (affects_caja && !user_id) {
-        return res.status(400).json({ error: "Falta el usuario para vincular el movimiento con caja." });
+    if (!user_id) {
+        return res.status(400).json({ error: "Falta el usuario que registra el movimiento." });
     }
 
     try {
         await db.beginTransaction();
 
-        // ✅ Verificar que la cuenta bancaria exista y esté activa
         const [bankResult] = await db.query(
             "SELECT * FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
             [bank_id]
@@ -130,7 +129,6 @@ router.post('/movimiento-manual', async (req, res) => {
 
         const bank = bankResult[0];
 
-        // ✅ Si es retiro, validar que el saldo del banco alcance
         if (type === 'withdrawal' && parseFloat(amount) > parseFloat(bank.current_balance)) {
             await db.rollback();
             return res.status(400).json({
@@ -140,7 +138,6 @@ router.post('/movimiento-manual', async (req, res) => {
 
         let cajaAbierta = null;
 
-        // ✅ Si afecta caja, validar caja abierta y saldo según el caso
         if (affects_caja) {
             const [cajaResult] = await db.query(
                 "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
@@ -154,7 +151,6 @@ router.post('/movimiento-manual', async (req, res) => {
 
             cajaAbierta = cajaResult[0];
 
-            // Si es DEPÓSITO, el efectivo sale de caja → validar que caja tenga suficiente
             if (type === 'deposit') {
                 const [movResult] = await db.query(
                     `SELECT 
@@ -175,7 +171,6 @@ router.post('/movimiento-manual', async (req, res) => {
                     });
                 }
             }
-            // Si es RETIRO, el efectivo entra a caja → no requiere validación de saldo en caja
         }
 
         // ✅ Insertar el movimiento bancario
@@ -208,6 +203,31 @@ router.post('/movimiento-manual', async (req, res) => {
             "UPDATE bancos SET current_balance = ? WHERE id = ?",
             [newBalance, bank_id]
         );
+
+        // ✅ Generar asiento contable
+        if (affects_caja) {
+            // Dinero se mueve entre Caja y Bancos (traspaso interno)
+            await crearAsiento(db, {
+                description: type === 'deposit' ? `Depósito externo: ${concept}` : `Retiro externo: ${concept}`,
+                reference_type: 'ajuste',
+                reference_id: movBancoResult.insertId,
+                user_id,
+                lines: type === 'deposit'
+                    ? [{ code: '1102', debit: amount }, { code: '3101', credit: amount }]
+                    : [{ code: '3101', debit: amount }, { code: '1102', credit: amount }]
+            });
+        } else {
+            // Dinero externo entra/sale directo del banco (no tocó caja) → contra Capital Social
+            await crearAsiento(db, {
+                description: type === 'deposit' ? `Depósito externo: ${concept}` : `Retiro externo: ${concept}`,
+                reference_type: 'ajuste',
+                reference_id: movBancoResult.insertId,
+                user_id: user_id || bank.id, // fallback por si no viene user_id cuando no afecta caja
+                lines: type === 'deposit'
+                    ? [{ code: '1102', debit: amount }, { code: '3101', credit: amount }]
+                    : [{ code: '3101', debit: amount }, { code: '1102', credit: amount }]
+            });
+        }
 
         await db.commit();
         res.json({ message: "Movimiento registrado con éxito", new_balance: newBalance });

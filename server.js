@@ -9,7 +9,7 @@ const sharp = require('sharp');
 const fs = require('fs');
 // Configura la aplicación Express
 const app = express(); // Crea una aplicación Express
-const PORT = 3000; // Define el puerto en el que el servidor estará escuchando
+const PORT = process.env.PORT || 3000; // Define el puerto en el que el servidor estará escuchando
 const db = require('./config/db'); // Importa la conexión
 const jwt = require('jsonwebtoken'); // Importamos JWT
 const bcrypt = require('bcryptjs'); // Importamos bcrypt

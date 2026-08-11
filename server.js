@@ -81,6 +81,9 @@ app.use('/ingresos-extra', ingresosExtraRoutes);
 const contabilidadRoutes = require('./routes/contabilidad.routes');
 app.use('/contabilidad', contabilidadRoutes);
 
+const dashboardRoutes = require('./routes/dashboard.routes');
+app.use('/dashboard', dashboardRoutes);
+
 //para que UptimeRobot no dispare funciones pesadas en el API
 app.get('/ping', (req, res) => {
   res.status(200).json({ message: 'pong' });

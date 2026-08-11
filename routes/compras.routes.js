@@ -1,7 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // Importa la conexión correctamente
-const { route } = require('./productos.routes');
+const db = require('../config/db');
 const { crearAsiento } = require('../helpers/contabilidad');
 
 // Ruta para hacer el insert de compra de productos
@@ -11,6 +10,8 @@ router.post('/', async (req, res) => {
         user_id,
         payment_type,
         payment_status,
+        payment_method,
+        bank_id,
         purchase_price,
         paid_amount,
         pending_amount,
@@ -22,12 +23,26 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Forma de pago inválida." });
     }
 
+    const entraSaleDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+
+    if (entraSaleDinero) {
+        const validMethods = ['cash', 'transfer', 'card'];
+        if (!validMethods.includes(payment_method)) {
+            return res.status(400).json({ error: "Método de pago inválido." });
+        }
+        if ((payment_method === 'transfer' || payment_method === 'card') && !bank_id) {
+            return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
+        }
+    }
+
     try {
         await db.beginTransaction();
 
-        // ✅ Si entra efectivo (cash o mixed con paid_amount > 0), exigir caja abierta y validar saldo
         let cajaAbierta = null;
-        if ((payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0) {
+        let bankAccount = null;
+
+        // ✅ Efectivo: exigir caja abierta y validar saldo
+        if (entraSaleDinero && payment_method === 'cash') {
             const [cajaResult] = await db.query(
                 "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
                 [user_id]
@@ -40,7 +55,6 @@ router.post('/', async (req, res) => {
 
             cajaAbierta = cajaResult[0];
 
-            // ✅ Validar saldo disponible en caja
             const [movResult] = await db.query(
                 `SELECT 
                     COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
@@ -61,17 +75,38 @@ router.post('/', async (req, res) => {
             }
         }
 
+        // ✅ Transferencia/Tarjeta: exigir cuenta activa y validar saldo
+        if (entraSaleDinero && (payment_method === 'transfer' || payment_method === 'card')) {
+            const [bankResult] = await db.query(
+                "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
+                [bank_id]
+            );
+
+            if (!bankResult.length) {
+                await db.rollback();
+                return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
+            }
+
+            bankAccount = bankResult[0];
+
+            if (parseFloat(paid_amount) > parseFloat(bankAccount.current_balance)) {
+                await db.rollback();
+                return res.status(400).json({
+                    error: `Saldo insuficiente en el banco. Disponible: L. ${parseFloat(bankAccount.current_balance).toFixed(2)}`
+                });
+            }
+        }
+
         // Insertar compra
         const [compraResult] = await db.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_status, purchase_price, paid_amount, pending_amount) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, purchase_price, paid_amount, pending_amount]
+                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, purchase_price, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, payment_method || 'cash', bank_id || null, purchase_price, paid_amount, pending_amount]
         );
         const purchase_id = compraResult.insertId;
-        console.log("✅ Compra insertada con ID:", purchase_id);
 
-        // ✅ Registrar movimiento de caja (egreso) si aplica
+        // ✅ Movimiento de caja (egreso) si fue efectivo
         if (cajaAbierta) {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
@@ -81,6 +116,24 @@ router.post('/', async (req, res) => {
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'expense', ?, ?, 'compra', ?)`,
                 [cajaAbierta.id, concept, paid_amount, purchase_id]
+            );
+        }
+
+        // ✅ Movimiento bancario (egreso) si fue transferencia/tarjeta
+        if (bankAccount) {
+            const concept = payment_type === 'cash'
+                ? `Compra #${purchase_id} (contado)`
+                : `Compra #${purchase_id} (abono inicial - mixto)`;
+
+            await db.query(
+                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'transfer_out', ?, ?, 'compra', ?)`,
+                [bank_id, paid_amount, concept, purchase_id]
+            );
+
+            await db.query(
+                "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
+                [paid_amount, bank_id]
             );
         }
 
@@ -104,7 +157,6 @@ router.post('/', async (req, res) => {
             );
 
             if (toneIdValue !== null) {
-
                 await db.query(
                     `UPDATE tonos
             SET quantity=quantity+?
@@ -124,23 +176,22 @@ router.post('/', async (req, res) => {
                 );
 
             } else {
-
                 await db.query(
                     `UPDATE productos
             SET quantity=quantity+?
             WHERE id=?`,
                     [product.quantity, product.product_id]
                 );
-
             }
         }
+
         // ✅ Generar asiento contable
-        const cuentaCaja = payment_type === 'cash' || payment_type === 'mixed' ? '1101' : null;
+        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
 
         const lines = [{ code: '1104', debit: purchase_price }]; // Inventario
 
-        if (paid_amount > 0 && cuentaCaja) {
-            lines.push({ code: cuentaCaja, credit: paid_amount }); // Caja
+        if (paid_amount > 0) {
+            lines.push({ code: cuentaDinero, credit: paid_amount });
         }
         if (pending_amount > 0) {
             lines.push({ code: '2101', credit: pending_amount }); // Cuentas por Pagar
@@ -153,6 +204,7 @@ router.post('/', async (req, res) => {
             user_id,
             lines
         });
+
         await db.commit();
         res.json({ message: "Compra realizada con éxito", purchase_id });
 
@@ -162,7 +214,6 @@ router.post('/', async (req, res) => {
         res.status(500).json({ error: "Error al registrar la compra" });
     }
 });
-
 
 router.get('/', async (req, res) => {
     try {
@@ -236,6 +287,5 @@ router.get('/:productId/:supplierId', async (req, res) => {
         });
     }
 });
-
 
 module.exports = router;

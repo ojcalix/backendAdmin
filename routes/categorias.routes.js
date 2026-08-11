@@ -21,41 +21,22 @@ router.get('/', async (req, res) => {
 // CREAR CATEGORÍA
 // ================================
 router.post('/', async (req, res) => {
-
-    console.log("🔥 POST /categorias EJECUTADO");
-
     const { categoryname, categorydescription, parent_id } = req.body;
 
-    console.log("DATOS RECIBIDOS:", {
-        categoryname,
-        categorydescription,
-        parent_id,
-    });
+    if (!categoryname) {
+        return res.status(400).json({ error: 'El nombre de la categoría es obligatorio.' });
+    }
 
     try {
-
         const [result] = await db.query(
-            `
-INSERT INTO categorias
-(name, description, parent_id)
-VALUES (?, ?, ?)
-`,
-            [
-                categoryname,
-                categorydescription,
-                parent_id || null
-            ]);
-
-        console.log("INSERT RESULT:");
-        console.log(result);
+            `INSERT INTO categorias (name, description, parent_id) VALUES (?, ?, ?)`,
+            [categoryname, categorydescription, parent_id || null]
+        );
 
         const [verify] = await db.query(
             'SELECT * FROM categorias WHERE id = ?',
             [result.insertId]
         );
-
-        console.log("REGISTRO CREADO:");
-        console.log(verify);
 
         res.status(201).json({
             success: true,
@@ -76,13 +57,7 @@ router.get('/:id', async (req, res) => {
 
     try {
         const [results] = await db.query(
-            `SELECT
-    id,
-    name,
-    description,
-    parent_id
-FROM categorias
-WHERE id = ?`
+            `SELECT id, name, description, parent_id FROM categorias WHERE id = ?`,
             [id]
         );
 
@@ -168,6 +143,13 @@ router.delete('/:id', async (req, res) => {
         });
 
     } catch (err) {
+        // ✅ Detectar si el error es por productos o subcategorías dependientes
+        if (err.code === 'ER_ROW_IS_REFERENCED_2' || err.code === 'ER_ROW_IS_REFERENCED') {
+            return res.status(400).json({
+                error: 'No se puede eliminar esta categoría porque tiene productos o subcategorías asociadas.'
+            });
+        }
+
         console.error(err);
         res.status(500).send('Error al eliminar categoría');
     }

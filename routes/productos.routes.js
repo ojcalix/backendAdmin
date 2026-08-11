@@ -64,7 +64,7 @@ router.post('/', upload.fields([
                 // Sube la imagen a Cloudinary usando stream
                 const uploadResult = await new Promise((resolve, reject) => {
                     const stream = cloudinary.uploader.upload_stream({
-                        folder: 'proyecto_copia/productos',  // Carpeta en Cloudinary
+                        folder: 'vansue/productos',  // Carpeta en Cloudinary
                         public_id: publicId,                 // Nombre del archivo en Cloudinary
                         resource_type: 'image',              // Tipo de recurso
                     }, (err, result) => err ? reject(err) : resolve(result)); // Callback con promesa
@@ -160,7 +160,7 @@ router.post('/', upload.fields([
                 const extraUpload = await new Promise((resolve, reject) => {
                     const stream = cloudinary.uploader.upload_stream(
                         {
-                            folder: 'proyecto_copia/productos_extra',
+                            folder: 'vansue/productos_extra',
                             public_id: extraPublicId,
                             resource_type: 'image',
                         },
@@ -188,7 +188,7 @@ router.post('/', upload.fields([
 
                 const hoverUpload = await new Promise((resolve, reject) => {
                     const stream = cloudinary.uploader.upload_stream(
-                        { folder: 'proyecto_copia/productos_hover', public_id: hoverPublicId },
+                        { folder: 'vansue/productos_hover', public_id: hoverPublicId },
                         (err, result) => (err ? reject(err) : resolve(result))
                     );
                     bufferToStream(hoverBuffer).pipe(stream);
@@ -231,7 +231,7 @@ router.post('/', upload.fields([
                 // Sube la imagen del tono a Cloudinary
                 const toneUpload = await new Promise((resolve, reject) => {
                     const stream = cloudinary.uploader.upload_stream({
-                        folder: 'proyecto_copia/tonos',
+                        folder: 'vansue/tonos',
                         public_id: tonePublicId,
                         resource_type: 'image',
                     }, (err, result) => err ? reject(err) : resolve(result));
@@ -675,7 +675,7 @@ router.put('/:id', upload.any(), async (req, res) => {
 
             const uploadResult = await new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream({
-                    folder: "proyecto_copia/productos",
+                    folder: "vansue/productos",
                     public_id: `${productName.replace(/\s+/g, "_").toLowerCase()}_${Date.now()}`
                 }, (err, result) => err ? reject(err) : resolve(result));
 
@@ -739,7 +739,7 @@ router.put('/:id', upload.any(), async (req, res) => {
             const upload = await new Promise((resolve,reject)=>{
 
                 const stream = cloudinary.uploader.upload_stream({
-                    folder:"proyecto_copia/productos_hover",
+                    folder:"vansue/productos_hover",
                     public_id:`hover_${Date.now()}`
                 },(err,result)=>err?reject(err):resolve(result));
 
@@ -774,7 +774,7 @@ router.put('/:id', upload.any(), async (req, res) => {
                 const upload = await new Promise((resolve,reject)=>{
 
                     const stream = cloudinary.uploader.upload_stream({
-                        folder:"proyecto_copia/productos_extra",
+                        folder:"vansue/productos_extra",
                         public_id:`extra_${Date.now()}_${Math.random()}`
                     },(err,result)=>err?reject(err):resolve(result));
 
@@ -835,7 +835,7 @@ router.put('/:id', upload.any(), async (req, res) => {
                 const upload = await new Promise((resolve,reject)=>{
 
                     const stream = cloudinary.uploader.upload_stream({
-                        folder:"proyecto_copia/tonos",
+                        folder:"vansue/tonos",
                         public_id:`${tone.name}_${Date.now()}`
                     },(err,result)=>err?reject(err):resolve(result));
 

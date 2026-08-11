@@ -33,7 +33,7 @@ router.post('/', auth, async (req, res) => {
 });
 
 // Obtener usuario por ID
-router.get('/:id', async (req, res) => {
+router.get('/:id', auth, async (req, res) => {
     const userId = req.params.id;
     try {
         const [results] = await db.query(
@@ -51,7 +51,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // Actualizar usuario
-router.put('/:id', async (req, res) => {
+router.put('/:id', auth, async (req, res) => {
     const userId = req.params.id;
     const { username, email, role, password } = req.body;
 
@@ -78,7 +78,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // Eliminar usuario
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', auth, async (req, res) => {
     const userId = req.params.id;
     try {
         await db.query('DELETE FROM usuarios WHERE id = ?', [userId]);

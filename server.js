@@ -13,6 +13,17 @@ const fs = require('fs');
 
 const db = require('./config/db');
 
+// Red de seguridad: una promesa rechazada sin .catch() en cualquier
+// parte del código (no solo en db.js) por defecto tumba el proceso
+// en Node 15+. Esto lo registra en el log en vez de matar el server.
+process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Promise Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -26,11 +37,17 @@ const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // ============================================
-// CORS — allowlist por variable de entorno
-// En Railway: Variables → FRONTEND_URL=https://vansueglamhn.com
-// (separa varios orígenes con coma si necesitas más de uno)
+// CORS — allowlist fija en código (para tu escala actual
+// esto es más confiable que depender de una variable de
+// entorno que hay que recordar configurar en Railway).
+// Si algún día agregas más dominios, súmalos a este array.
 // ============================================
-const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5500').split(',');
+const allowedOrigins = [
+    'https://vansueglamhn.com',
+    'https://www.vansueglamhn.com',
+    'http://localhost:5500', // desarrollo local
+    ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',') : []),
+];
 
 app.use(cors({
     origin: function (origin, callback) {
@@ -38,15 +55,23 @@ app.use(cors({
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
+            console.warn('Origin bloqueado por CORS:', origin);
             callback(new Error('No permitido por CORS: ' + origin));
         }
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(bodyParser.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Logger mínimo — así el log de Railway muestra cada petición
+// que SÍ llega al servidor, incluyendo los preflight OPTIONS.
+app.use((req, res, next) => {
+    console.log(`${req.method} ${req.originalUrl} — origin: ${req.headers.origin || 'sin origin'}`);
+    next();
+});
 
 // ============================================
 // Rutas

@@ -45,14 +45,18 @@ const upload = multer({ storage });
 const allowedOrigins = [
     'https://vansueglamhn.com',
     'https://www.vansueglamhn.com',
-    'http://localhost:5500', // desarrollo local
     ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(',') : []),
 ];
+
+// Live Server (y herramientas similares) usan un puerto distinto cada vez
+// que abres un proyecto — en vez de listar puertos fijos, se permite
+// cualquier puerto de localhost/127.0.0.1 durante desarrollo.
+const isLocalOrigin = (origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
 
 app.use(cors({
     origin: function (origin, callback) {
         // origin es undefined en peticiones sin navegador (curl, Postman)
-        if (!origin || allowedOrigins.includes(origin)) {
+        if (!origin || allowedOrigins.includes(origin) || isLocalOrigin(origin)) {
             callback(null, true);
         } else {
             console.warn('Origin bloqueado por CORS:', origin);

@@ -1,105 +1,107 @@
-// Importa los módulos necesarios
+// ============================================
+// Configuración inicial
+// ============================================
 require('dotenv').config();
-const express = require('express'); // Framework para crear y manejar servidores web
-const mysql = require('mysql2'); // Librería para conectarse y realizar consultas a MySQL
-const bodyParser = require('body-parser'); // Middleware para procesar datos JSON en las solicitudes
-const cors = require('cors'); // Middleware para permitir solicitudes desde otros dominios
-const multer = require('multer');
+
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
 const path = require('path');
+const multer = require('multer');
 const sharp = require('sharp');
 const fs = require('fs');
-// Configura la aplicación Express
-const app = express(); // Crea una aplicación Express
-const PORT = process.env.PORT || 3000; // Define el puerto en el que el servidor estará escuchando
-const db = require('./config/db'); // Importa la conexión
-const jwt = require('jsonwebtoken'); // Importamos JWT
-const bcrypt = require('bcryptjs'); // Importamos bcrypt
-const SECRET_KEY = 'secreto_super_seguro'; // Declarar la clave secreta aquí
-// Configuración de multer (almacenamiento en memoria)
+
+const db = require('./config/db');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// ============================================
+// Multer (subida de archivos en memoria)
+// NOTA: si productos.routes.js ya declara su propio
+// multer/sharp internamente, esto puede sobrar aquí.
+// Revísalo y bórralo si no se usa en este archivo.
+// ============================================
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// Aplica middleware global
-// Habilitar CORS
+// ============================================
+// CORS — allowlist por variable de entorno
+// En Railway: Variables → FRONTEND_URL=https://vansueglamhn.com
+// (separa varios orígenes con coma si necesitas más de uno)
+// ============================================
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5500').split(',');
+
 app.use(cors({
-    origin: '*', // Permite solicitudes desde cualquier origen
+    origin: function (origin, callback) {
+        // origin es undefined en peticiones sin navegador (curl, Postman)
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('No permitido por CORS: ' + origin));
+        }
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-app.use(bodyParser.json()); // Convierte automáticamente el cuerpo de las solicitudes a JSON
-
-const loginRoutes = require('./routes/login.routes');
-app.use('/login', loginRoutes);
-
-const usuariosRoutes = require('./routes/usuarios.routes');
-app.use('/usuarios', usuariosRoutes);
-
-const proveedoresRoutes = require('./routes/proveedores.routes');
-app.use('/proveedores', proveedoresRoutes);
-
-const categoriasRoutes = require('./routes/categorias.routes');
-app.use('/categorias', categoriasRoutes);
-
-const comprasRoutes = require('./routes/compras.routes');
-app.use('/compras', comprasRoutes);
-
-const ventasRoutes = require('./routes/ventas.routes');
-app.use('/ventas', ventasRoutes);
-
-const productosRoutes = require('./routes/productos.routes');
-app.use('/productos', productosRoutes);
-
-const clientesRoutes = require('./routes/clientes.routes');
-//const { request } = require('http');
-app.use('/clientes', clientesRoutes);
-
-const generosRoutes = require('./routes/generos.routes');
-app.use('/generos', generosRoutes);
-
-const producto_proveedorRouter = require('./routes/producto_proveedor.routes');
-app.use('/producto_proveedor', producto_proveedorRouter);
-
-const cuentasPorCobrarRoutes = require('./routes/cuentasPorCobrar.routes');
-app.use('/cuentas-por-cobrar', cuentasPorCobrarRoutes);
-
-const cajaRoutes = require('./routes/caja.routes');
-app.use('/caja', cajaRoutes);
-
-const gastosRoutes = require('./routes/gastos.routes');
-app.use('/gastos', gastosRoutes);
-
-const cuentasPorPagarRoutes = require('./routes/cuentasPorPagar.routes');
-app.use('/cuentas-por-pagar', cuentasPorPagarRoutes);
-
-const bancosRoutes = require('./routes/bancos.routes');
-app.use('/bancos', bancosRoutes);
-
-const ingresosExtraRoutes = require('./routes/ingresosExtra.routes');
-app.use('/ingresos-extra', ingresosExtraRoutes);
-
-const contabilidadRoutes = require('./routes/contabilidad.routes');
-app.use('/contabilidad', contabilidadRoutes);
-
-const dashboardRoutes = require('./routes/dashboard.routes');
-app.use('/dashboard', dashboardRoutes);
-
-//para que UptimeRobot no dispare funciones pesadas en el API
-app.get('/ping', (req, res) => {
-  res.status(200).json({ message: 'pong' });
-});
-
-// Ruta para manejar el inicio de sesión
-// app.post define una ruta para manejar solicitudes POST
-
-// Servir archivos estáticos de la carpeta 'uploads'
-// Esto le dice a Express que cualquier archivo que esté en la carpeta 'uploads'
-// Middleware para servir archivos estáticos
+app.use(bodyParser.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Inicia el servidor en el puerto definido
-// app.listen escucha las solicitudes en el puerto indicado desde todas las interfaces de red
+// ============================================
+// Rutas
+// ============================================
+const routes = [
+    { path: '/login', file: './routes/login.routes' },
+    { path: '/usuarios', file: './routes/usuarios.routes' },
+    { path: '/proveedores', file: './routes/proveedores.routes' },
+    { path: '/categorias', file: './routes/categorias.routes' },
+    { path: '/compras', file: './routes/compras.routes' },
+    { path: '/ventas', file: './routes/ventas.routes' },
+    { path: '/productos', file: './routes/productos.routes' },
+    { path: '/clientes', file: './routes/clientes.routes' },
+    { path: '/generos', file: './routes/generos.routes' },
+    { path: '/producto_proveedor', file: './routes/producto_proveedor.routes' },
+    { path: '/cuentas-por-cobrar', file: './routes/cuentasPorCobrar.routes' },
+    { path: '/caja', file: './routes/caja.routes' },
+    { path: '/gastos', file: './routes/gastos.routes' },
+    { path: '/cuentas-por-pagar', file: './routes/cuentasPorPagar.routes' },
+    { path: '/bancos', file: './routes/bancos.routes' },
+    { path: '/ingresos-extra', file: './routes/ingresosExtra.routes' },
+    { path: '/contabilidad', file: './routes/contabilidad.routes' },
+    { path: '/dashboard', file: './routes/dashboard.routes' },
+];
+
+routes.forEach(({ path: routePath, file }) => {
+    app.use(routePath, require(file));
+});
+
+// Endpoint de salud (para UptimeRobot, sin lógica pesada)
+app.get('/ping', (req, res) => {
+    res.status(200).json({ message: 'pong' });
+});
+
+// ============================================
+// 404 — ruta no encontrada
+// ============================================
+app.use((req, res) => {
+    res.status(404).json({ success: false, message: 'Ruta no encontrada' });
+});
+
+// ============================================
+// Manejador de errores global
+// Así CUALQUIER error (CORS rechazado, fallo de BD, etc.)
+// responde con las cabeceras correctas en vez de que
+// el navegador lo confunda con un fallo de CORS.
+// ============================================
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ success: false, message: 'Error interno del servidor' });
+});
+
+// ============================================
+// Arranque del servidor
+// ============================================
 app.listen(PORT, '0.0.0.0', () => {
-    // Indica en la consola que el servidor está corriendo
     console.log(`Servidor corriendo en http://0.0.0.0:${PORT}`);
 });

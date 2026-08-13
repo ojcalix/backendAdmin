@@ -3,7 +3,9 @@ const router = express.Router();
 const db = require('../config/db');
 const { crearAsiento } = require('../helpers/contabilidad');
 
-// Ruta para hacer el insert de compra de productos
+// ========================
+// POST /compras
+// ========================
 router.post('/', async (req, res) => {
     const {
         supplier_id,
@@ -35,27 +37,28 @@ router.post('/', async (req, res) => {
         }
     }
 
+    const connection = await db.getConnection();
+
     try {
-        await db.beginTransaction();
+        await connection.beginTransaction();
 
         let cajaAbierta = null;
         let bankAccount = null;
 
-        // ✅ Efectivo: exigir caja abierta y validar saldo
         if (entraSaleDinero && payment_method === 'cash') {
-            const [cajaResult] = await db.query(
+            const [cajaResult] = await connection.query(
                 "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
                 [user_id]
             );
 
             if (!cajaResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({ error: "Debes abrir tu caja antes de registrar compras en efectivo." });
             }
 
             cajaAbierta = cajaResult[0];
 
-            const [movResult] = await db.query(
+            const [movResult] = await connection.query(
                 `SELECT 
                     COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
                     COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
@@ -68,37 +71,35 @@ router.post('/', async (req, res) => {
                 - parseFloat(movResult[0].total_expense);
 
             if (parseFloat(paid_amount) > availableCash) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en caja. Disponible: L. ${availableCash.toFixed(2)}`
                 });
             }
         }
 
-        // ✅ Transferencia/Tarjeta: exigir cuenta activa y validar saldo
         if (entraSaleDinero && (payment_method === 'transfer' || payment_method === 'card')) {
-            const [bankResult] = await db.query(
+            const [bankResult] = await connection.query(
                 "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
                 [bank_id]
             );
 
             if (!bankResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
             }
 
             bankAccount = bankResult[0];
 
             if (parseFloat(paid_amount) > parseFloat(bankAccount.current_balance)) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en el banco. Disponible: L. ${parseFloat(bankAccount.current_balance).toFixed(2)}`
                 });
             }
         }
 
-        // Insertar compra
-        const [compraResult] = await db.query(
+        const [compraResult] = await connection.query(
             `INSERT INTO compras 
                 (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, purchase_price, paid_amount, pending_amount) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -106,44 +107,41 @@ router.post('/', async (req, res) => {
         );
         const purchase_id = compraResult.insertId;
 
-        // ✅ Movimiento de caja (egreso) si fue efectivo
         if (cajaAbierta) {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
                 : `Compra #${purchase_id} (abono inicial - mixto)`;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'expense', ?, ?, 'compra', ?)`,
                 [cajaAbierta.id, concept, paid_amount, purchase_id]
             );
         }
 
-        // ✅ Movimiento bancario (egreso) si fue transferencia/tarjeta
         if (bankAccount) {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
                 : `Compra #${purchase_id} (abono inicial - mixto)`;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
                  VALUES (?, 'transfer_out', ?, ?, 'compra', ?)`,
                 [bank_id, paid_amount, concept, purchase_id]
             );
 
-            await db.query(
+            await connection.query(
                 "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
                 [paid_amount, bank_id]
             );
         }
 
-        // Insertar detalle de compra y actualizar stock
         for (const product of products) {
             const toneIdValue = (product.tone_id !== null && product.tone_id !== "" && !isNaN(product.tone_id))
                 ? parseInt(product.tone_id)
                 : null;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO detalle_compras
         (purchase_id,product_id,quantity,purchase_price,tone_id)
         VALUES (?,?,?,?,?)`,
@@ -157,14 +155,14 @@ router.post('/', async (req, res) => {
             );
 
             if (toneIdValue !== null) {
-                await db.query(
+                await connection.query(
                     `UPDATE tonos
             SET quantity=quantity+?
             WHERE id=?`,
                     [product.quantity, toneIdValue]
                 );
 
-                await db.query(
+                await connection.query(
                     `UPDATE productos
             SET quantity=(
                 SELECT COALESCE(SUM(quantity),0)
@@ -176,7 +174,7 @@ router.post('/', async (req, res) => {
                 );
 
             } else {
-                await db.query(
+                await connection.query(
                     `UPDATE productos
             SET quantity=quantity+?
             WHERE id=?`,
@@ -185,19 +183,18 @@ router.post('/', async (req, res) => {
             }
         }
 
-        // ✅ Generar asiento contable
-        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102';
 
-        const lines = [{ code: '1104', debit: purchase_price }]; // Inventario
+        const lines = [{ code: '1104', debit: purchase_price }];
 
         if (paid_amount > 0) {
             lines.push({ code: cuentaDinero, credit: paid_amount });
         }
         if (pending_amount > 0) {
-            lines.push({ code: '2101', credit: pending_amount }); // Cuentas por Pagar
+            lines.push({ code: '2101', credit: pending_amount });
         }
 
-        await crearAsiento(db, {
+        await crearAsiento(connection, {
             description: `Compra #${purchase_id}`,
             reference_type: 'compra',
             reference_id: purchase_id,
@@ -205,16 +202,21 @@ router.post('/', async (req, res) => {
             lines
         });
 
-        await db.commit();
+        await connection.commit();
         res.json({ message: "Compra realizada con éxito", purchase_id });
 
     } catch (error) {
-        await db.rollback();
+        await connection.rollback();
         console.error("❌ Error al registrar la compra:", error);
         res.status(500).json({ error: "Error al registrar la compra" });
+    } finally {
+        connection.release();
     }
 });
 
+// ========================
+// GET /compras
+// ========================
 router.get('/', async (req, res) => {
     try {
         const query = `

@@ -328,103 +328,33 @@ router.get('/', async (req, res) => {
 });
 router.get('/todos', async (req, res) => {
     try {
-
         const query = `
             SELECT
-                'product' AS rowType,
-
                 p.id AS productId,
-                NULL AS toneId,
-                NULL AS toneName,
-
-                GROUP_CONCAT(DISTINCT cb.barcode) AS barCodes,
-
                 p.name AS productName,
                 p.brand AS productBrand,
                 p.description AS productDescription,
-
-                c.name AS productCategory,
-
-                p.inventory_type,
-
                 p.sale_price AS salePrice,
-
-                p.quantity AS productQuantity,
-
+                p.inventory_type,
                 p.image AS productImage,
-
-                p.registration_date AS createdAt
-
-            FROM productos p
-
-            LEFT JOIN categorias c
-                ON c.id = p.category_id
-
-            LEFT JOIN codigos_barras cb
-                ON cb.product_id = p.id
-                AND cb.tone_id IS NULL
-
-            WHERE p.inventory_type IN ('simple','barcode')
-
-            GROUP BY p.id
-
-            UNION ALL
-
-            SELECT
-                'tone' AS rowType,
-
-                p.id AS productId,
-
-                t.id AS toneId,
-
-                t.tone_name AS toneName,
-
-                cb.barcode AS barCodes,
-
-                p.name AS productName,
-
-                p.brand AS productBrand,
-
-                p.description AS productDescription,
-
+                p.registration_date AS createdAt,
                 c.name AS productCategory,
-
-                p.inventory_type,
-
-                p.sale_price AS salePrice,
-
-                t.quantity AS productQuantity,
-
-                t.image AS productImage,
-
-                p.registration_date AS createdAt
-
-            FROM tonos t
-
-            INNER JOIN productos p
-                ON p.id = t.product_id
-
-            INNER JOIN categorias c
-                ON c.id = p.category_id
-
-            LEFT JOIN codigos_barras cb
-                ON cb.tone_id = t.id
-
-            WHERE p.inventory_type='tones'
-
-            ORDER BY productId DESC,toneName ASC
+                GROUP_CONCAT(DISTINCT cb.barcode) AS barCodes,
+                COALESCE(SUM(t.quantity), p.quantity) AS productQuantity
+            FROM productos p
+            LEFT JOIN categorias c ON c.id = p.category_id
+            LEFT JOIN tonos t ON t.product_id = p.id
+            LEFT JOIN codigos_barras cb ON cb.product_id = p.id AND cb.tone_id IS NULL
+            GROUP BY p.id
+            ORDER BY p.name ASC
         `;
 
         const [results] = await db.query(query);
-
         res.status(200).json(results);
 
     } catch (err) {
-
         console.error("Error al obtener productos:", err);
-
         res.status(500).send("Error al obtener productos");
-
     }
 });
 

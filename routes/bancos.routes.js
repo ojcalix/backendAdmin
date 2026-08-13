@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /bancos
@@ -114,23 +115,26 @@ router.post('/movimiento-manual', async (req, res) => {
         return res.status(400).json({ error: "Falta el usuario que registra el movimiento." });
     }
 
-    try {
-        await db.beginTransaction();
+    // ✅ Con pool, las transacciones necesitan una conexión dedicada
+    const connection = await db.getConnection();
 
-        const [bankResult] = await db.query(
+    try {
+        await connection.beginTransaction();
+
+        const [bankResult] = await connection.query(
             "SELECT * FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
             [bank_id]
         );
 
         if (!bankResult.length) {
-            await db.rollback();
+            await connection.rollback();
             return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
         }
 
         const bank = bankResult[0];
 
         if (type === 'withdrawal' && parseFloat(amount) > parseFloat(bank.current_balance)) {
-            await db.rollback();
+            await connection.rollback();
             return res.status(400).json({
                 error: `Saldo insuficiente en el banco. Disponible: L. ${parseFloat(bank.current_balance).toFixed(2)}`
             });
@@ -139,20 +143,20 @@ router.post('/movimiento-manual', async (req, res) => {
         let cajaAbierta = null;
 
         if (affects_caja) {
-            const [cajaResult] = await db.query(
+            const [cajaResult] = await connection.query(
                 "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
                 [user_id]
             );
 
             if (!cajaResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({ error: "Debes abrir tu caja para vincular este movimiento con el efectivo." });
             }
 
             cajaAbierta = cajaResult[0];
 
             if (type === 'deposit') {
-                const [movResult] = await db.query(
+                const [movResult] = await connection.query(
                     `SELECT 
                         COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
                         COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
@@ -165,7 +169,7 @@ router.post('/movimiento-manual', async (req, res) => {
                     - parseFloat(movResult[0].total_expense);
 
                 if (parseFloat(amount) > availableCash) {
-                    await db.rollback();
+                    await connection.rollback();
                     return res.status(400).json({
                         error: `Saldo insuficiente en caja para depositar. Disponible: L. ${availableCash.toFixed(2)}`
                     });
@@ -174,7 +178,7 @@ router.post('/movimiento-manual', async (req, res) => {
         }
 
         // ✅ Insertar el movimiento bancario
-        const [movBancoResult] = await db.query(
+        const [movBancoResult] = await connection.query(
             `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type) 
              VALUES (?, ?, ?, ?, 'otro')`,
             [bank_id, type, amount, concept]
@@ -187,7 +191,7 @@ router.post('/movimiento-manual', async (req, res) => {
                 ? `Depósito a banco: ${concept}`
                 : `Retiro de banco: ${concept}`;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, ?, ?, ?, 'otro', ?)`,
                 [cajaAbierta.id, cajaType, cajaConcept, amount, movBancoResult.insertId]
@@ -199,15 +203,24 @@ router.post('/movimiento-manual', async (req, res) => {
             ? parseFloat(bank.current_balance) + parseFloat(amount)
             : parseFloat(bank.current_balance) - parseFloat(amount);
 
-        await db.query(
+        await connection.query(
             "UPDATE bancos SET current_balance = ? WHERE id = ?",
             [newBalance, bank_id]
         );
 
         // ✅ Generar asiento contable
         if (affects_caja) {
-            // Dinero se mueve entre Caja y Bancos (traspaso interno)
-            await crearAsiento(db, {
+            await crearAsiento(connection, {
+                description: type === 'deposit' ? `Depósito a banco: ${concept}` : `Retiro de banco: ${concept}`,
+                reference_type: 'ajuste',
+                reference_id: movBancoResult.insertId,
+                user_id,
+                lines: type === 'deposit'
+                    ? [{ code: '1102', debit: amount }, { code: '1101', credit: amount }]
+                    : [{ code: '1101', debit: amount }, { code: '1102', credit: amount }]
+            });
+        } else {
+            await crearAsiento(connection, {
                 description: type === 'deposit' ? `Depósito externo: ${concept}` : `Retiro externo: ${concept}`,
                 reference_type: 'ajuste',
                 reference_id: movBancoResult.insertId,
@@ -216,26 +229,17 @@ router.post('/movimiento-manual', async (req, res) => {
                     ? [{ code: '1102', debit: amount }, { code: '3101', credit: amount }]
                     : [{ code: '3101', debit: amount }, { code: '1102', credit: amount }]
             });
-        } else {
-            // Dinero externo entra/sale directo del banco (no tocó caja) → contra Capital Social
-            await crearAsiento(db, {
-                description: type === 'deposit' ? `Depósito externo: ${concept}` : `Retiro externo: ${concept}`,
-                reference_type: 'ajuste',
-                reference_id: movBancoResult.insertId,
-                user_id: user_id || bank.id, // fallback por si no viene user_id cuando no afecta caja
-                lines: type === 'deposit'
-                    ? [{ code: '1102', debit: amount }, { code: '3101', credit: amount }]
-                    : [{ code: '3101', debit: amount }, { code: '1102', credit: amount }]
-            });
         }
 
-        await db.commit();
+        await connection.commit();
         res.json({ message: "Movimiento registrado con éxito", new_balance: newBalance });
 
     } catch (error) {
-        await db.rollback();
+        await connection.rollback();
         console.error("❌ Error al registrar movimiento manual:", error);
         res.status(500).json({ error: "Error al registrar el movimiento" });
+    } finally {
+        connection.release();
     }
 });
 

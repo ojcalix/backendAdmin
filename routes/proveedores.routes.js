@@ -1,12 +1,15 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // conexión mysql2/promise
+const db = require('../config/db');
 
-// Ruta para obtener todos los proveedores
+// ========================
+// GET /proveedores
+// ========================
 router.get('/', async (req, res) => {
     try {
-        const query = 'SELECT id, name, address, phone, email, registration_date FROM proveedores';
-        const [results] = await db.query(query);
+        const [results] = await db.query(
+            'SELECT id, name, address, phone, email, registration_date FROM proveedores'
+        );
         res.status(200).json(results);
     } catch (err) {
         console.error('Error al cargar proveedores:', err);
@@ -14,14 +17,18 @@ router.get('/', async (req, res) => {
     }
 });
 
-// Ruta para insertar un proveedor
+// ========================
+// POST /proveedores
+// ========================
 router.post('/', async (req, res) => {
+    const { name, address, phone, email } = req.body;
+
     try {
-        const { name, address, phone, email } = req.body;
-        const query = 'INSERT INTO proveedores (name, address, phone, email) VALUES (?, ?, ?, ?)';
-        
-        const [result] = await db.query(query, [name, address, phone, email]);
-        
+        const [result] = await db.query(
+            'INSERT INTO proveedores (name, address, phone, email) VALUES (?, ?, ?, ?)',
+            [name, address, phone, email]
+        );
+
         res.status(201).json({
             message: 'Proveedor agregado correctamente',
             proveedorId: result.insertId
@@ -32,18 +39,22 @@ router.post('/', async (req, res) => {
     }
 });
 
-// Ruta para obtener un proveedor por ID
+// ========================
+// GET /proveedores/:id
+// ========================
 router.get('/:id', async (req, res) => {
+    const supplierId = req.params.id;
+
     try {
-        const supplierId = req.params.id;
-        const query = 'SELECT id, name, address, phone, email FROM proveedores WHERE id = ?';
-        
-        const [results] = await db.query(query, [supplierId]);
-        
+        const [results] = await db.query(
+            'SELECT id, name, address, phone, email FROM proveedores WHERE id = ?',
+            [supplierId]
+        );
+
         if (results.length === 0) {
             return res.status(404).send('Proveedor no encontrado');
         }
-        
+
         res.status(200).json(results[0]);
     } catch (err) {
         console.error('Error al obtener proveedor:', err);
@@ -51,20 +62,21 @@ router.get('/:id', async (req, res) => {
     }
 });
 
-// Ruta para actualizar un proveedor
+// ========================
+// PUT /proveedores/:id
+// ========================
 router.put('/:id', async (req, res) => {
+    const supplierId = req.params.id;
+    const { name, address, phone, email } = req.body;
+
     try {
-        const supplierId = req.params.id;
-        const { name, address, phone, email } = req.body;
-        
-        const query = `
-            UPDATE proveedores
-            SET name = ?, address = ?, phone = ?, email = ?
-            WHERE id = ?
-        `;
-        
-        await db.query(query, [name, address, phone, email, supplierId]);
-        
+        await db.query(
+            `UPDATE proveedores
+             SET name = ?, address = ?, phone = ?, email = ?
+             WHERE id = ?`,
+            [name, address, phone, email, supplierId]
+        );
+
         res.status(200).json({
             success: true,
             message: 'Proveedor actualizado correctamente'
@@ -75,14 +87,15 @@ router.put('/:id', async (req, res) => {
     }
 });
 
-// Ruta para eliminar un proveedor
+// ========================
+// DELETE /proveedores/:id
+// ========================
 router.delete('/:id', async (req, res) => {
+    const supplierId = req.params.id;
+
     try {
-        const supplierId = req.params.id;
-        const query = 'DELETE FROM proveedores WHERE id = ?';
-        
-        await db.query(query, [supplierId]);
-        
+        await db.query('DELETE FROM proveedores WHERE id = ?', [supplierId]);
+
         res.status(200).json({
             success: true,
             message: 'Proveedor eliminado correctamente'

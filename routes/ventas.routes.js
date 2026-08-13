@@ -1,9 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../config/db'); // Importa la conexión correctamente
+const db = require('../config/db');
 const { crearAsiento } = require('../helpers/contabilidad');
-// Ruta para agregar una nueva venta
 
+// ========================
+// POST /ventas
+// ========================
 router.post('/', async (req, res) => {
     const {
         user_id,
@@ -44,20 +46,22 @@ router.post('/', async (req, res) => {
         }
     }
 
+    const connection = await db.getConnection();
+
     try {
-        await db.beginTransaction();
+        await connection.beginTransaction();
 
         let cajaAbierta = null;
         let bankAccount = null;
 
         if (entraDinero && payment_method === 'cash') {
-            const [cajaResult] = await db.query(
+            const [cajaResult] = await connection.query(
                 "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
                 [user_id]
             );
 
             if (!cajaResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas en efectivo." });
             }
 
@@ -65,13 +69,13 @@ router.post('/', async (req, res) => {
         }
 
         if (entraDinero && (payment_method === 'transfer' || payment_method === 'card')) {
-            const [bankResult] = await db.query(
+            const [bankResult] = await connection.query(
                 "SELECT id FROM bancos WHERE id = ? AND status = 'active'",
                 [bank_id]
             );
 
             if (!bankResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
             }
 
@@ -79,7 +83,7 @@ router.post('/', async (req, res) => {
         }
 
         // ✅ Insertar venta
-        const [ventaResult] = await db.query(
+        const [ventaResult] = await connection.query(
             `INSERT INTO ventas 
                 (user_id, customer_id, payment_type, payment_status, payment_method, bank_id, total, paid_amount, pending_amount, earned_points) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -93,7 +97,7 @@ router.post('/', async (req, res) => {
                 ? `Venta #${sale_id} (contado)`
                 : `Venta #${sale_id} (abono inicial - mixto)`;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'income', ?, ?, 'venta', ?)`,
                 [cajaAbierta.id, concept, paid_amount, sale_id]
@@ -106,13 +110,13 @@ router.post('/', async (req, res) => {
                 ? `Venta #${sale_id} (contado)`
                 : `Venta #${sale_id} (abono inicial - mixto)`;
 
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
                  VALUES (?, 'transfer_in', ?, ?, 'venta', ?)`,
                 [bank_id, paid_amount, concept, sale_id]
             );
 
-            await db.query(
+            await connection.query(
                 "UPDATE bancos SET current_balance = current_balance + ? WHERE id = ?",
                 [paid_amount, bank_id]
             );
@@ -124,33 +128,33 @@ router.post('/', async (req, res) => {
             const { product_id, tone_id, quantity, subtotal } = product;
 
             if (tone_id) {
-                const [toneStockResult] = await db.query(
+                const [toneStockResult] = await connection.query(
                     "SELECT quantity FROM tonos WHERE id = ?",
                     [tone_id]
                 );
 
                 if (!toneStockResult.length || quantity > toneStockResult[0].quantity) {
-                    await db.rollback();
+                    await connection.rollback();
                     return res.status(400).json({ error: `Stock insuficiente o tono no encontrado (ID: ${tone_id})` });
                 }
 
-                await db.query(
+                await connection.query(
                     "UPDATE tonos SET quantity = quantity - ? WHERE id = ?",
                     [quantity, tone_id]
                 );
             }
 
-            const [stockResult] = await db.query(
+            const [stockResult] = await connection.query(
                 "SELECT quantity FROM productos WHERE id = ?",
                 [product_id]
             );
 
             if (!stockResult.length || quantity > stockResult[0].quantity) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({ error: `Stock insuficiente o producto no encontrado (ID: ${product_id})` });
             }
 
-            await db.query(
+            await connection.query(
                 "UPDATE productos SET quantity = quantity - ? WHERE id = ?",
                 [quantity, product_id]
             );
@@ -158,42 +162,42 @@ router.post('/', async (req, res) => {
             const puntos = Math.floor(subtotal / 30);
             totalEarnedPoints += puntos;
 
-            await db.query(
+            await connection.query(
                 "INSERT INTO ventas_detalle (sale_id, product_id, tone_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?, ?)",
                 [sale_id, product_id, tone_id, quantity, subtotal, puntos]
             );
         }
 
-        await db.query(
+        await connection.query(
             "UPDATE ventas SET earned_points = ? WHERE id = ?",
             [totalEarnedPoints, sale_id]
         );
 
         if (totalEarnedPoints > 0 && customer_id !== null) {
-            await db.query(
+            await connection.query(
                 "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'earned')",
                 [customer_id, sale_id, totalEarnedPoints]
             );
 
-            await db.query(
+            await connection.query(
                 "UPDATE clientes SET accumulated_points = accumulated_points + ? WHERE id = ?",
                 [totalEarnedPoints, customer_id]
             );
         }
 
         // ✅ Generar asiento contable
-        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102';
 
-        const lines = [{ code: '4101', credit: total }]; // Ventas
+        const lines = [{ code: '4101', credit: total }];
 
         if (paid_amount > 0) {
             lines.push({ code: cuentaDinero, debit: paid_amount });
         }
         if (pending_amount > 0) {
-            lines.push({ code: '1103', debit: pending_amount }); // Cuentas por Cobrar
+            lines.push({ code: '1103', debit: pending_amount });
         }
 
-        await crearAsiento(db, {
+        await crearAsiento(connection, {
             description: `Venta #${sale_id}`,
             reference_type: 'venta',
             reference_id: sale_id,
@@ -201,17 +205,21 @@ router.post('/', async (req, res) => {
             lines
         });
 
-        await db.commit();
+        await connection.commit();
         res.json({ message: "Venta registrada con éxito", sale_id });
 
     } catch (error) {
-        await db.rollback();
+        await connection.rollback();
         console.error("❌ Error en el registro de venta:", error);
         res.status(500).json({ error: "Error al registrar la venta" });
+    } finally {
+        connection.release();
     }
 });
 
-// Ruta para cargar las ventas
+// ========================
+// GET /ventas
+// ========================
 router.get('/', async (req, res) => {
     const query = `
         SELECT
@@ -236,8 +244,9 @@ router.get('/', async (req, res) => {
     }
 });
 
-//Obteniendo la factura del cliente
+// ========================
 // GET /ventas/:id
+// ========================
 router.get('/:id', async (req, res) => {
     const { id } = req.params;
 
@@ -266,7 +275,6 @@ router.get('/:id', async (req, res) => {
     LEFT JOIN tonos t ON vd.tone_id = t.id
     WHERE vd.sale_id = ?
 `, [id]);
-
 
         res.json({
             venta: venta[0],

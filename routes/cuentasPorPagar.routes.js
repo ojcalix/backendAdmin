@@ -5,7 +5,6 @@ const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /cuentas-por-pagar
-// Lista compras con saldo pendiente (pending o partial)
 // ========================
 router.get('/', async (req, res) => {
     const { status, search } = req.query;
@@ -51,7 +50,6 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /cuentas-por-pagar/:purchase_id/historial
-// Historial de pagos de una compra específica
 // ========================
 router.get('/:purchase_id/historial', async (req, res) => {
     const { purchase_id } = req.params;
@@ -82,7 +80,6 @@ router.get('/:purchase_id/historial', async (req, res) => {
 
 // ========================
 // POST /cuentas-por-pagar/pago
-// Registra un pago a proveedor y actualiza el saldo de la compra
 // ========================
 router.post('/pago', async (req, res) => {
     const { purchase_id, supplier_id, user_id, amount, payment_method, bank_id, notes } = req.body;
@@ -100,26 +97,28 @@ router.post('/pago', async (req, res) => {
         return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
     }
 
+    const connection = await db.getConnection();
+
     try {
-        await db.beginTransaction();
+        await connection.beginTransaction();
 
         let cajaAbierta = null;
         let bankAccount = null;
 
         if (payment_method === 'cash') {
-            const [cajaResult] = await db.query(
+            const [cajaResult] = await connection.query(
                 "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
                 [user_id]
             );
 
             if (!cajaResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({ error: "Debes abrir tu caja antes de registrar pagos en efectivo." });
             }
 
             cajaAbierta = cajaResult[0];
 
-            const [movResult] = await db.query(
+            const [movResult] = await connection.query(
                 `SELECT 
                     COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
                     COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
@@ -132,49 +131,48 @@ router.post('/pago', async (req, res) => {
                 - parseFloat(movResult[0].total_expense);
 
             if (parseFloat(amount) > availableCash) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en caja. Disponible: L. ${availableCash.toFixed(2)}`
                 });
             }
         }
 
-        // ✅ Si es transferencia/tarjeta, validar cuenta y saldo (dinero sale del banco)
         if (payment_method === 'transfer' || payment_method === 'card') {
-            const [bankResult] = await db.query(
+            const [bankResult] = await connection.query(
                 "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
                 [bank_id]
             );
 
             if (!bankResult.length) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
             }
 
             bankAccount = bankResult[0];
 
             if (parseFloat(amount) > parseFloat(bankAccount.current_balance)) {
-                await db.rollback();
+                await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en el banco. Disponible: L. ${parseFloat(bankAccount.current_balance).toFixed(2)}`
                 });
             }
         }
 
-        const [compraResult] = await db.query(
+        const [compraResult] = await connection.query(
             "SELECT purchase_price, paid_amount, pending_amount, payment_status FROM compras WHERE id = ? FOR UPDATE",
             [purchase_id]
         );
 
         if (!compraResult.length) {
-            await db.rollback();
+            await connection.rollback();
             return res.status(404).json({ error: "Compra no encontrada." });
         }
 
         const compra = compraResult[0];
 
         if (parseFloat(amount) > parseFloat(compra.pending_amount)) {
-            await db.rollback();
+            await connection.rollback();
             return res.status(400).json({ error: "El monto excede el saldo pendiente." });
         }
 
@@ -182,14 +180,14 @@ router.post('/pago', async (req, res) => {
         const newPendingAmount = parseFloat(compra.pending_amount) - parseFloat(amount);
         const newStatus = newPendingAmount <= 0 ? 'paid' : 'partial';
 
-        const [pagoResult] = await db.query(
+        const [pagoResult] = await connection.query(
             `INSERT INTO pagos_proveedores (purchase_id, supplier_id, user_id, amount, payment_method, notes) 
              VALUES (?, ?, ?, ?, ?, ?)`,
             [purchase_id, supplier_id, user_id, amount, payment_method, notes || null]
         );
 
         if (cajaAbierta) {
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'expense', ?, ?, 'pago_proveedor', ?)`,
                 [cajaAbierta.id, `Pago a proveedor - Compra #${purchase_id}`, amount, pagoResult.insertId]
@@ -197,40 +195,39 @@ router.post('/pago', async (req, res) => {
         }
 
         if (bankAccount) {
-            await db.query(
+            await connection.query(
                 `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
                  VALUES (?, 'transfer_out', ?, ?, 'pago_proveedor', ?)`,
                 [bank_id, amount, `Pago a proveedor - Compra #${purchase_id}`, pagoResult.insertId]
             );
 
-            await db.query(
+            await connection.query(
                 "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
                 [amount, bank_id]
             );
         }
 
-        await db.query(
+        await connection.query(
             `UPDATE compras 
              SET paid_amount = ?, pending_amount = ?, payment_status = ? 
              WHERE id = ?`,
             [newPaidAmount, newPendingAmount, newStatus, purchase_id]
         );
 
-        // ✅ Generar asiento contable
-        const cuentaOrigen = payment_method === 'cash' ? '1101' : '1102'; // Caja o Bancos
+        const cuentaOrigen = payment_method === 'cash' ? '1101' : '1102';
 
-        await crearAsiento(db, {
+        await crearAsiento(connection, {
             description: `Pago a proveedor - Compra #${purchase_id}`,
             reference_type: 'pago_proveedor',
             reference_id: pagoResult.insertId,
             user_id,
             lines: [
-                { code: '2101', debit: amount },      // Cuentas por Pagar
-                { code: cuentaOrigen, credit: amount } // Caja o Bancos
+                { code: '2101', debit: amount },
+                { code: cuentaOrigen, credit: amount }
             ]
         });
 
-        await db.commit();
+        await connection.commit();
         res.json({
             message: "Pago registrado con éxito",
             new_status: newStatus,
@@ -238,9 +235,11 @@ router.post('/pago', async (req, res) => {
         });
 
     } catch (error) {
-        await db.rollback();
+        await connection.rollback();
         console.error("❌ Error al registrar el pago:", error);
         res.status(500).json({ error: "Error al registrar el pago" });
+    } finally {
+        connection.release();
     }
 });
 

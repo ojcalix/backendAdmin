@@ -4,13 +4,16 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const db = require('../config/db');
 
-const SECRET_KEY = 'secreto_super_seguro'; // Mantenlo seguro en variable de entorno
+// ⚠️ Ver nota abajo sobre esta clave
+const SECRET_KEY = process.env.JWT_SECRET || 'secreto_super_seguro';
 
+// ========================
+// POST /login
+// ========================
 router.post('/', async (req, res) => {
     const { username, password } = req.body;
 
     try {
-        // Buscar usuario
         const [results] = await db.query(
             'SELECT * FROM usuarios WHERE username = ?',
             [username]
@@ -22,20 +25,17 @@ router.post('/', async (req, res) => {
 
         const user = results[0];
 
-        // Comparar contraseña
         const isPasswordValid = await bcrypt.compare(password, user.password);
         if (!isPasswordValid) {
             return res.status(401).json({ success: false, message: 'Credenciales incorrectas' });
         }
 
-        // Generar token JWT
         const token = jwt.sign(
             { userId: user.id, role: user.role },
             SECRET_KEY,
             { expiresIn: '1h' }
         );
 
-        // ✅ Devolver también los datos del usuario (sin la contraseña)
         res.status(200).json({
             success: true,
             message: 'Inicio de sesión exitoso',

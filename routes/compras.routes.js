@@ -20,19 +20,27 @@ router.post('/', async (req, res) => {
         products
     } = req.body;
 
+    if (!supplier_id || !user_id || !products || !products.length) {
+        return res.status(400).json({ error: "Datos incompletos." });
+    }
+
     const validPaymentTypes = ['cash', 'credit', 'mixed'];
     if (!validPaymentTypes.includes(payment_type)) {
         return res.status(400).json({ error: "Forma de pago inválida." });
     }
 
-    const entraSaleDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+    // Normalizado desde el inicio: misma técnica que en ventas.js, así la
+    // verificación de caja/banco y el INSERT final usan siempre el mismo valor.
+    const normalizedPaymentMethod = payment_method || 'cash';
 
-    if (entraSaleDinero) {
+    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+
+    if (entraDinero) {
         const validMethods = ['cash', 'transfer', 'card'];
-        if (!validMethods.includes(payment_method)) {
+        if (!validMethods.includes(normalizedPaymentMethod)) {
             return res.status(400).json({ error: "Método de pago inválido." });
         }
-        if ((payment_method === 'transfer' || payment_method === 'card') && !bank_id) {
+        if ((normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') && !bank_id) {
             return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
         }
     }
@@ -45,19 +53,24 @@ router.post('/', async (req, res) => {
         let cajaAbierta = null;
         let bankAccount = null;
 
-        if (entraSaleDinero && payment_method === 'cash') {
-            const [cajaResult] = await connection.query(
-                "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
-                [user_id]
-            );
+        // ✅ Caja abierta: OBLIGATORIA para cualquier compra, sin importar el
+        // método de pago — misma lógica que en ventas.js. Representa la
+        // sesión de trabajo del usuario, no solo el efectivo.
+        const [cajaResult] = await connection.query(
+            "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
+            [user_id]
+        );
 
-            if (!cajaResult.length) {
-                await connection.rollback();
-                return res.status(400).json({ error: "Debes abrir tu caja antes de registrar compras en efectivo." });
-            }
+        if (!cajaResult.length) {
+            await connection.rollback();
+            return res.status(400).json({ error: "Debes abrir tu caja antes de registrar compras." });
+        }
 
-            cajaAbierta = cajaResult[0];
+        cajaAbierta = cajaResult[0];
 
+        // ✅ Efectivo: además de exigir caja abierta, se valida que haya
+        // saldo suficiente en caja para pagar esta compra.
+        if (entraDinero && normalizedPaymentMethod === 'cash') {
             const [movResult] = await connection.query(
                 `SELECT 
                     COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
@@ -78,7 +91,9 @@ router.post('/', async (req, res) => {
             }
         }
 
-        if (entraSaleDinero && (payment_method === 'transfer' || payment_method === 'card')) {
+        // ✅ Transferencia/tarjeta: se bloquea la fila del banco (FOR UPDATE)
+        // y se valida saldo suficiente antes de continuar.
+        if (entraDinero && (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card')) {
             const [bankResult] = await connection.query(
                 "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
                 [bank_id]
@@ -99,15 +114,17 @@ router.post('/', async (req, res) => {
             }
         }
 
+        // ✅ Insertar compra
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
                 (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, purchase_price, paid_amount, pending_amount) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, payment_method || 'cash', bank_id || null, purchase_price, paid_amount, pending_amount]
+            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, purchase_price, paid_amount, pending_amount]
         );
         const purchase_id = compraResult.insertId;
 
-        if (cajaAbierta) {
+        // ✅ Movimiento de caja solo si el dinero salió en efectivo
+        if (entraDinero && normalizedPaymentMethod === 'cash') {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
                 : `Compra #${purchase_id} (abono inicial - mixto)`;
@@ -119,6 +136,7 @@ router.post('/', async (req, res) => {
             );
         }
 
+        // ✅ Movimiento bancario si el pago fue transferencia/tarjeta
         if (bankAccount) {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
@@ -136,54 +154,39 @@ router.post('/', async (req, res) => {
             );
         }
 
+        // ✅ Detalle de la compra — ahora por variante, no por "tono"
         for (const product of products) {
-            const toneIdValue = (product.tone_id !== null && product.tone_id !== "" && !isNaN(product.tone_id))
-                ? parseInt(product.tone_id)
-                : null;
+            const { product_id, variant_id, quantity, purchase_price: linePrice } = product;
 
-            await connection.query(
-                `INSERT INTO detalle_compras
-        (purchase_id,product_id,quantity,purchase_price,tone_id)
-        VALUES (?,?,?,?,?)`,
-                [
-                    purchase_id,
-                    product.product_id,
-                    product.quantity,
-                    product.purchase_price,
-                    toneIdValue
-                ]
+            if (!variant_id) {
+                await connection.rollback();
+                return res.status(400).json({ error: `Falta la variante para el producto (ID: ${product_id})` });
+            }
+
+            const [variantExists] = await connection.query(
+                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+                [variant_id, product_id]
             );
 
-            if (toneIdValue !== null) {
-                await connection.query(
-                    `UPDATE tonos
-            SET quantity=quantity+?
-            WHERE id=?`,
-                    [product.quantity, toneIdValue]
-                );
-
-                await connection.query(
-                    `UPDATE productos
-            SET quantity=(
-                SELECT COALESCE(SUM(quantity),0)
-                FROM tonos
-                WHERE product_id=?
-            )
-            WHERE id=?`,
-                    [product.product_id, product.product_id]
-                );
-
-            } else {
-                await connection.query(
-                    `UPDATE productos
-            SET quantity=quantity+?
-            WHERE id=?`,
-                    [product.quantity, product.product_id]
-                );
+            if (!variantExists.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: `Variante no encontrada (ID: ${variant_id})` });
             }
+
+            await connection.query(
+                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
+                 VALUES (?, ?, ?, ?, ?)`,
+                [purchase_id, product_id, variant_id, quantity, linePrice]
+            );
+
+            await connection.query(
+                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
+                [quantity, variant_id]
+            );
         }
 
-        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102';
+        // ✅ Generar asiento contable
+        const cuentaDinero = normalizedPaymentMethod === 'cash' ? '1101' : '1102';
 
         const lines = [{ code: '1104', debit: purchase_price }];
 
@@ -203,7 +206,7 @@ router.post('/', async (req, res) => {
         });
 
         await connection.commit();
-        res.json({ message: "Compra realizada con éxito", purchase_id });
+        res.json({ message: "Compra registrada con éxito", purchase_id });
 
     } catch (error) {
         await connection.rollback();
@@ -225,11 +228,12 @@ router.get('/', async (req, res) => {
                 p.name AS proveedor,
                 u.username AS usuario,
                 c.purchase_price,
+                c.payment_status,
                 c.purchase_date
             FROM compras c 
             JOIN proveedores p ON c.supplier_id = p.id
             JOIN usuarios u ON c.user_id = u.id
-            ORDER BY purchase_date DESC
+            ORDER BY c.purchase_date DESC
         `;
 
         const [results] = await db.query(query);
@@ -240,6 +244,50 @@ router.get('/', async (req, res) => {
     }
 });
 
+// ========================
+// GET /compras/:id
+// Detalle de una compra, con producto + variante
+// ========================
+router.get('/:id(\\d+)', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const [compra] = await db.query(`
+            SELECT c.id, c.purchase_price, c.purchase_date, u.username, pr.name AS proveedor
+            FROM compras c
+            JOIN usuarios u ON c.user_id = u.id
+            JOIN proveedores pr ON c.supplier_id = pr.id
+            WHERE c.id = ?
+        `, [id]);
+
+        if (!compra.length) return res.status(404).json({ error: 'Compra no encontrada' });
+
+        const [detalle] = await db.query(`
+            SELECT 
+                p.name AS product_name,
+                p.brand,
+                v.variant_name,
+                dc.quantity,
+                dc.purchase_price,
+                (dc.quantity * dc.purchase_price) AS subtotal
+            FROM detalle_compras dc
+            JOIN productos p ON dc.product_id = p.id
+            LEFT JOIN variantes v ON dc.variant_id = v.id
+            WHERE dc.purchase_id = ?
+        `, [id]);
+
+        res.json({ compra: compra[0], productos: detalle });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al obtener la compra' });
+    }
+});
+
+// ========================
+// GET /compras/buscar/:term
+// Búsqueda de proveedores (el nombre del endpoint se mantiene por
+// compatibilidad con el frontend existente)
+// ========================
 router.get('/buscar/:term', async (req, res) => {
     try {
         const term = `%${req.params.term}%`;
@@ -258,36 +306,63 @@ router.get('/buscar/:term', async (req, res) => {
     }
 });
 
-router.get('/:productId/:supplierId', async (req, res) => {
+// ========================
+// GET /compras/:productId/:supplierId/:variantId
+// Precio de compra (por proveedor) y precio de venta de una variante.
+// Primero busca un precio propio de ESA variante (perfumería: cada
+// tamaño con su propio precio). Si no existe, cae al precio GLOBAL del
+// producto con variant_id NULL (maquillaje: mismo precio para todos los
+// tonos, registrado una sola vez) — misma lógica que
+// producto_proveedor.js /detalle/:productId/:supplierId.
+// ========================
+router.get('/:productId/:supplierId/:variantId', async (req, res) => {
     try {
-        const { productId, supplierId } = req.params;
+        const { productId, supplierId, variantId } = req.params;
 
-        const [rows] = await db.query(`
-            SELECT
-                pp.purchase_price AS purchasePrice,
-                p.sale_price AS salePrice
-            FROM producto_proveedor pp
-            INNER JOIN productos p
-                ON p.id=pp.product_id
-            WHERE pp.product_id=?
-            AND pp.supplier_id=?
-            LIMIT 1
-        `, [productId, supplierId]);
+        const [specific] = await db.query(
+            `SELECT purchase_price AS purchasePrice
+             FROM producto_proveedor
+             WHERE product_id = ? AND supplier_id = ? AND variant_id = ?
+             LIMIT 1`,
+            [productId, supplierId, variantId]
+        );
 
-        if (rows.length === 0) {
+        let purchaseRow = specific.length ? specific[0] : null;
+
+        if (!purchaseRow) {
+            const [general] = await db.query(
+                `SELECT purchase_price AS purchasePrice
+                 FROM producto_proveedor
+                 WHERE product_id = ? AND supplier_id = ? AND variant_id IS NULL
+                 LIMIT 1`,
+                [productId, supplierId]
+            );
+            purchaseRow = general.length ? general[0] : null;
+        }
+
+        if (!purchaseRow) {
             return res.status(404).json({
                 message: "Este producto no tiene precio de compra registrado para este proveedor."
             });
         }
 
-        res.json(rows[0]);
+        const [variantSale] = await db.query(
+            `SELECT sale_price FROM variantes WHERE id = ?`,
+            [variantId]
+        );
+
+        if (!variantSale.length) {
+            return res.status(404).json({ message: "Variante no encontrada." });
+        }
+
+        res.json({ purchasePrice: purchaseRow.purchasePrice, salePrice: variantSale[0].sale_price });
 
     } catch (err) {
         console.error("Error al obtener precios:", err);
-        res.status(500).json({
-            message: "Error al obtener los precios."
-        });
+        res.status(500).json({ message: "Error al obtener los precios." });
     }
 });
+
+module.exports = router;
 
 module.exports = router;

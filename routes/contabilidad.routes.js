@@ -19,6 +19,59 @@ router.get('/cuentas', async (req, res) => {
 });
 
 // ========================
+// GET /contabilidad/resumen-pasivos
+// Total de deuda del negocio, sin importar la fuente:
+// proveedores (compras pendientes/parciales) + fuentes de
+// financiamiento (tarjetas, propietario, otro) con saldo activo.
+// ========================
+router.get('/resumen-pasivos', async (req, res) => {
+    try {
+        const [proveedores] = await db.query(`
+            SELECT 
+                c.id AS purchase_id,
+                p.name AS supplier_name,
+                c.purchase_date,
+                c.purchase_price,
+                c.paid_amount,
+                c.pending_amount,
+                c.payment_status
+            FROM compras c
+            INNER JOIN proveedores p ON c.supplier_id = p.id
+            WHERE c.payment_status IN ('pending', 'partial')
+            ORDER BY c.purchase_date DESC
+        `);
+
+        const [financiamiento] = await db.query(`
+            SELECT 
+                ff.id AS source_id,
+                ff.name AS source_name,
+                ff.type,
+                ff.current_balance,
+                ff.credit_limit
+            FROM fuentes_financiamiento ff
+            WHERE ff.status = 'active' AND ff.current_balance > 0
+            ORDER BY ff.current_balance DESC
+        `);
+
+        const deuda_proveedores = proveedores.reduce((sum, p) => sum + parseFloat(p.pending_amount), 0);
+        const deuda_financiamiento = financiamiento.reduce((sum, f) => sum + parseFloat(f.current_balance), 0);
+        const deuda_total = deuda_proveedores + deuda_financiamiento;
+
+        res.json({
+            deuda_proveedores,
+            deuda_financiamiento,
+            deuda_total,
+            proveedores,
+            financiamiento
+        });
+
+    } catch (error) {
+        console.error("❌ Error al generar resumen de pasivos:", error);
+        res.status(500).json({ error: "Error al generar el resumen de pasivos" });
+    }
+});
+
+// ========================
 // GET /contabilidad/libro-diario
 // Lista los asientos contables, con su total (suma de débitos), filtrable
 // ========================
@@ -118,7 +171,6 @@ router.get('/balance-general', async (req, res) => {
     }
 
     try {
-        // ✅ Saldo de cada cuenta de balance (activo, pasivo, patrimonio) hasta la fecha dada
         const [balances] = await db.query(
             `SELECT 
                 cc.id, cc.code, cc.name, cc.type, cc.nature,
@@ -147,7 +199,6 @@ router.get('/balance-general', async (req, res) => {
         const total_pasivo = pasivo.reduce((sum, a) => sum + a.balance, 0);
         const total_patrimonio_registrado = patrimonio.reduce((sum, a) => sum + a.balance, 0);
 
-        // ✅ Utilidad acumulada (ingresos - costos - gastos) hasta la fecha, para que el balance cuadre
         const [resultados] = await db.query(
             `SELECT 
                 cc.type,

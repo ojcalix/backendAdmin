@@ -99,6 +99,7 @@ const routes = [
     { path: '/ingresos-extra', file: './routes/ingresosExtra.routes' },
     { path: '/contabilidad', file: './routes/contabilidad.routes' },
     { path: '/dashboard', file: './routes/dashboard.routes' },
+    { path: '/fuentes_financiamiento', file: './routes/fuentes_financiamiento'},
 ];
 
 routes.forEach(({ path: routePath, file }) => {

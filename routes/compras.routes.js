@@ -4,6 +4,113 @@ const db = require('../config/db');
 const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
+// GET /compras/fuentes-financiamiento
+// ========================
+router.get('/fuentes-financiamiento', async (req, res) => {
+    try {
+        const [results] = await db.query(
+            `SELECT id, name, type, current_balance, credit_limit 
+             FROM fuentes_financiamiento 
+             WHERE status = 'active' 
+             ORDER BY name ASC`
+        );
+        res.json(results);
+    } catch (err) {
+        console.error('Error al obtener fuentes de financiamiento:', err);
+        res.status(500).json({ error: 'Error al obtener fuentes de financiamiento' });
+    }
+});
+
+// ========================
+// POST /compras/apertura
+// Carga inventario que YA existía antes de usar el sistema.
+// No requiere caja, no genera cuenta por pagar, no toca proveedor.
+// Se identifica como "apertura" porque supplier_id queda NULL —
+// una compra normal siempre requiere un proveedor.
+// Asiento: Debe Inventario (1104) / Haber Capital Social (3101).
+// ========================
+router.post('/apertura', async (req, res) => {
+    const { user_id, products, notes } = req.body;
+
+    if (!user_id || !products || !products.length) {
+        return res.status(400).json({ error: "Usuario y al menos un producto son obligatorios." });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        let total = 0;
+
+        for (const p of products) {
+            if (!p.variant_id || !p.quantity || p.purchase_price === undefined || p.purchase_price === null) {
+                await connection.rollback();
+                return res.status(400).json({ error: "Cada línea necesita variante, cantidad y costo." });
+            }
+            total += parseFloat(p.purchase_price) * parseInt(p.quantity);
+        }
+
+        if (total <= 0) {
+            await connection.rollback();
+            return res.status(400).json({ error: "El total debe ser mayor a cero." });
+        }
+
+        const [compraResult] = await connection.query(
+            `INSERT INTO compras 
+                (supplier_id, user_id, payment_type, payment_method, payment_status, purchase_price, paid_amount, pending_amount) 
+             VALUES (NULL, ?, 'cash', 'cash', 'paid', ?, ?, 0)`,
+            [user_id, total, total]
+        );
+        const purchase_id = compraResult.insertId;
+
+        for (const p of products) {
+            const [variantExists] = await connection.query(
+                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+                [p.variant_id, p.product_id]
+            );
+
+            if (!variantExists.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: `Variante no encontrada (ID: ${p.variant_id})` });
+            }
+
+            await connection.query(
+                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
+                 VALUES (?, ?, ?, ?, ?)`,
+                [purchase_id, p.product_id, p.variant_id, p.quantity, p.purchase_price]
+            );
+
+            await connection.query(
+                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
+                [p.quantity, p.variant_id]
+            );
+        }
+
+        await crearAsiento(connection, {
+            description: notes ? `Inventario inicial: ${notes}` : `Inventario inicial (apertura)`,
+            reference_type: 'compra',
+            reference_id: purchase_id,
+            user_id,
+            lines: [
+                { code: '1104', debit: total },
+                { code: '3101', credit: total }
+            ]
+        });
+
+        await connection.commit();
+        res.json({ message: "Inventario inicial registrado con éxito", purchase_id, total });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("❌ Error al registrar inventario inicial:", error);
+        res.status(500).json({ error: "Error al registrar el inventario inicial" });
+    } finally {
+        connection.release();
+    }
+});
+
+// ========================
 // POST /compras
 // ========================
 router.post('/', async (req, res) => {
@@ -14,6 +121,7 @@ router.post('/', async (req, res) => {
         payment_status,
         payment_method,
         bank_id,
+        financing_source_id,
         purchase_price,
         paid_amount,
         pending_amount,
@@ -29,19 +137,20 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Forma de pago inválida." });
     }
 
-    // Normalizado desde el inicio: misma técnica que en ventas.js, así la
-    // verificación de caja/banco y el INSERT final usan siempre el mismo valor.
     const normalizedPaymentMethod = payment_method || 'cash';
 
     const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
 
     if (entraDinero) {
-        const validMethods = ['cash', 'transfer', 'card'];
+        const validMethods = ['cash', 'transfer', 'card', 'financing'];
         if (!validMethods.includes(normalizedPaymentMethod)) {
             return res.status(400).json({ error: "Método de pago inválido." });
         }
         if ((normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') && !bank_id) {
             return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
+        }
+        if (normalizedPaymentMethod === 'financing' && !financing_source_id) {
+            return res.status(400).json({ error: "Debe seleccionar una fuente de financiamiento (tarjeta, propietario, etc.)." });
         }
     }
 
@@ -52,10 +161,8 @@ router.post('/', async (req, res) => {
 
         let cajaAbierta = null;
         let bankAccount = null;
+        let financingSource = null;
 
-        // ✅ Caja abierta: OBLIGATORIA para cualquier compra, sin importar el
-        // método de pago — misma lógica que en ventas.js. Representa la
-        // sesión de trabajo del usuario, no solo el efectivo.
         const [cajaResult] = await connection.query(
             "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
             [user_id]
@@ -68,8 +175,6 @@ router.post('/', async (req, res) => {
 
         cajaAbierta = cajaResult[0];
 
-        // ✅ Efectivo: además de exigir caja abierta, se valida que haya
-        // saldo suficiente en caja para pagar esta compra.
         if (entraDinero && normalizedPaymentMethod === 'cash') {
             const [movResult] = await connection.query(
                 `SELECT 
@@ -91,8 +196,6 @@ router.post('/', async (req, res) => {
             }
         }
 
-        // ✅ Transferencia/tarjeta: se bloquea la fila del banco (FOR UPDATE)
-        // y se valida saldo suficiente antes de continuar.
         if (entraDinero && (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card')) {
             const [bankResult] = await connection.query(
                 "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
@@ -114,16 +217,38 @@ router.post('/', async (req, res) => {
             }
         }
 
-        // ✅ Insertar compra
+        if (entraDinero && normalizedPaymentMethod === 'financing') {
+            const [sourceResult] = await connection.query(
+                "SELECT id, name, account_id, current_balance, credit_limit FROM fuentes_financiamiento WHERE id = ? AND status = 'active' FOR UPDATE",
+                [financing_source_id]
+            );
+
+            if (!sourceResult.length) {
+                await connection.rollback();
+                return res.status(404).json({ error: "Fuente de financiamiento no encontrada o inactiva." });
+            }
+
+            financingSource = sourceResult[0];
+
+            if (financingSource.credit_limit !== null) {
+                const nuevoSaldo = parseFloat(financingSource.current_balance) + parseFloat(paid_amount);
+                if (nuevoSaldo > parseFloat(financingSource.credit_limit)) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        error: `Esta operación excede el límite de crédito de "${financingSource.name}".`
+                    });
+                }
+            }
+        }
+
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, purchase_price, paid_amount, pending_amount) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, purchase_price, paid_amount, pending_amount]
+                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, purchase_price, paid_amount, pending_amount]
         );
         const purchase_id = compraResult.insertId;
 
-        // ✅ Movimiento de caja solo si el dinero salió en efectivo
         if (entraDinero && normalizedPaymentMethod === 'cash') {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
@@ -136,7 +261,6 @@ router.post('/', async (req, res) => {
             );
         }
 
-        // ✅ Movimiento bancario si el pago fue transferencia/tarjeta
         if (bankAccount) {
             const concept = payment_type === 'cash'
                 ? `Compra #${purchase_id} (contado)`
@@ -154,7 +278,21 @@ router.post('/', async (req, res) => {
             );
         }
 
-        // ✅ Detalle de la compra — ahora por variante, no por "tono"
+        if (financingSource) {
+            const concept = `Compra #${purchase_id} pagada con ${financingSource.name}`;
+
+            await connection.query(
+                `INSERT INTO movimientos_financiamiento (financing_source_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'charge', ?, ?, 'compra', ?)`,
+                [financingSource.id, paid_amount, concept, purchase_id]
+            );
+
+            await connection.query(
+                "UPDATE fuentes_financiamiento SET current_balance = current_balance + ? WHERE id = ?",
+                [paid_amount, financingSource.id]
+            );
+        }
+
         for (const product of products) {
             const { product_id, variant_id, quantity, purchase_price: linePrice } = product;
 
@@ -185,13 +323,23 @@ router.post('/', async (req, res) => {
             );
         }
 
-        // ✅ Generar asiento contable
-        const cuentaDinero = normalizedPaymentMethod === 'cash' ? '1101' : '1102';
+        let cuentaDineroCode;
+        if (normalizedPaymentMethod === 'cash') {
+            cuentaDineroCode = '1101';
+        } else if (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') {
+            cuentaDineroCode = '1102';
+        } else if (normalizedPaymentMethod === 'financing') {
+            const [accountRow] = await connection.query(
+                'SELECT code FROM cuentas_contables WHERE id = ?',
+                [financingSource.account_id]
+            );
+            cuentaDineroCode = accountRow[0].code;
+        }
 
         const lines = [{ code: '1104', debit: purchase_price }];
 
         if (paid_amount > 0) {
-            lines.push({ code: cuentaDinero, credit: paid_amount });
+            lines.push({ code: cuentaDineroCode, credit: paid_amount });
         }
         if (pending_amount > 0) {
             lines.push({ code: '2101', credit: pending_amount });
@@ -219,19 +367,21 @@ router.post('/', async (req, res) => {
 
 // ========================
 // GET /compras
+// LEFT JOIN a proveedores + marca is_opening_balance cuando supplier_id es NULL
 // ========================
 router.get('/', async (req, res) => {
     try {
         const query = `
             SELECT 
                 c.id,
-                p.name AS proveedor,
+                COALESCE(p.name, 'Apertura de Inventario') AS proveedor,
                 u.username AS usuario,
                 c.purchase_price,
                 c.payment_status,
-                c.purchase_date
+                c.purchase_date,
+                (c.supplier_id IS NULL) AS is_opening_balance
             FROM compras c 
-            JOIN proveedores p ON c.supplier_id = p.id
+            LEFT JOIN proveedores p ON c.supplier_id = p.id
             JOIN usuarios u ON c.user_id = u.id
             ORDER BY c.purchase_date DESC
         `;
@@ -246,17 +396,22 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /compras/:id
-// Detalle de una compra, con producto + variante
 // ========================
 router.get('/:id(\\d+)', async (req, res) => {
     try {
         const { id } = req.params;
 
         const [compra] = await db.query(`
-            SELECT c.id, c.purchase_price, c.purchase_date, u.username, pr.name AS proveedor
+            SELECT 
+                c.id, c.purchase_price, c.purchase_date, c.payment_type, c.payment_status,
+                c.payment_method, c.paid_amount, c.pending_amount,
+                u.username, COALESCE(pr.name, 'Apertura de Inventario') AS proveedor,
+                ff.name AS financing_source_name,
+                (c.supplier_id IS NULL) AS is_opening_balance
             FROM compras c
             JOIN usuarios u ON c.user_id = u.id
-            JOIN proveedores pr ON c.supplier_id = pr.id
+            LEFT JOIN proveedores pr ON c.supplier_id = pr.id
+            LEFT JOIN fuentes_financiamiento ff ON c.financing_source_id = ff.id
             WHERE c.id = ?
         `, [id]);
 
@@ -285,8 +440,6 @@ router.get('/:id(\\d+)', async (req, res) => {
 
 // ========================
 // GET /compras/buscar/:term
-// Búsqueda de proveedores (el nombre del endpoint se mantiene por
-// compatibilidad con el frontend existente)
 // ========================
 router.get('/buscar/:term', async (req, res) => {
     try {
@@ -308,12 +461,6 @@ router.get('/buscar/:term', async (req, res) => {
 
 // ========================
 // GET /compras/:productId/:supplierId/:variantId
-// Precio de compra (por proveedor) y precio de venta de una variante.
-// Primero busca un precio propio de ESA variante (perfumería: cada
-// tamaño con su propio precio). Si no existe, cae al precio GLOBAL del
-// producto con variant_id NULL (maquillaje: mismo precio para todos los
-// tonos, registrado una sola vez) — misma lógica que
-// producto_proveedor.js /detalle/:productId/:supplierId.
 // ========================
 router.get('/:productId/:supplierId/:variantId', async (req, res) => {
     try {
@@ -362,7 +509,5 @@ router.get('/:productId/:supplierId/:variantId', async (req, res) => {
         res.status(500).json({ message: "Error al obtener los precios." });
     }
 });
-
-module.exports = router;
 
 module.exports = router;

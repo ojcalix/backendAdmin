@@ -5,6 +5,9 @@ const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /cuentas-por-cobrar
+// is_opening_balance = 1 cuando la "venta" no tiene productos asociados
+// (ventas_detalle vacío) — así se identifica un saldo inicial sin
+// necesidad de una columna nueva en la tabla.
 // ========================
 router.get('/', async (req, res) => {
     const { status, search } = req.query;
@@ -19,7 +22,10 @@ router.get('/', async (req, res) => {
                 v.total,
                 v.paid_amount,
                 v.pending_amount,
-                v.payment_status
+                v.payment_status,
+                NOT EXISTS (
+                    SELECT 1 FROM ventas_detalle vd WHERE vd.sale_id = v.id
+                ) AS is_opening_balance
             FROM ventas v
             INNER JOIN clientes c ON v.customer_id = c.id
             WHERE v.payment_status IN ('pending', 'partial')
@@ -79,6 +85,71 @@ router.get('/:sale_id/historial', async (req, res) => {
 });
 
 // ========================
+// POST /cuentas-por-cobrar/saldo-inicial
+// Registra la deuda que un cliente YA tenía antes de empezar a usar el
+// sistema. Se guarda como una "venta" sin productos (no toca inventario,
+// no genera puntos) para que aparezca en esta pantalla y acepte abonos
+// con el mismo flujo de POST /cuentas-por-cobrar/pago que ya existe.
+//
+// Asiento: Debe Cuentas por Cobrar (1103) / Haber Capital Social (3101)
+// — no es una venta del período, es el punto de partida del negocio.
+// ========================
+router.post('/saldo-inicial', async (req, res) => {
+    const { customer_id, user_id, amount, notes } = req.body;
+
+    if (!customer_id || !user_id || !amount || amount <= 0) {
+        return res.status(400).json({ error: "Cliente, usuario y un monto válido son obligatorios." });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        const [customerResult] = await connection.query(
+            "SELECT id FROM clientes WHERE id = ?",
+            [customer_id]
+        );
+
+        if (!customerResult.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: "Cliente no encontrado." });
+        }
+
+        const [ventaResult] = await connection.query(
+            `INSERT INTO ventas 
+                (user_id, customer_id, payment_type, payment_status, payment_method, total, paid_amount, pending_amount, earned_points) 
+             VALUES (?, ?, 'credit', 'pending', 'cash', ?, 0, ?, 0)`,
+            [user_id, customer_id, amount, amount]
+        );
+        const sale_id = ventaResult.insertId;
+
+        await crearAsiento(connection, {
+            description: notes
+                ? `Saldo inicial de cliente #${customer_id}: ${notes}`
+                : `Saldo inicial de cliente #${customer_id}`,
+            reference_type: 'venta',
+            reference_id: sale_id,
+            user_id,
+            lines: [
+                { code: '1103', debit: amount },
+                { code: '3101', credit: amount }
+            ]
+        });
+
+        await connection.commit();
+        res.json({ message: "Saldo inicial registrado con éxito", sale_id });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("❌ Error al registrar saldo inicial:", error);
+        res.status(500).json({ error: "Error al registrar el saldo inicial" });
+    } finally {
+        connection.release();
+    }
+});
+
+// ========================
 // POST /cuentas-por-cobrar/pago
 // ========================
 router.post('/pago', async (req, res) => {
@@ -107,7 +178,7 @@ router.post('/pago', async (req, res) => {
 
         if (payment_method === 'cash') {
             const [cajaResult] = await connection.query(
-                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
+                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
                 [user_id]
             );
 

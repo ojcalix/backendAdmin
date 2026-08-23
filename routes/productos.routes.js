@@ -74,7 +74,6 @@ async function attachVariantsToProducts(products) {
             .filter(v => v.product_id === p.productId)
             .map(v => ({
                 ...v,
-                // imagen propia de la variante > imagen principal del producto > null
                 image: variantImageMap[v.id] || productMainImageMap[p.productId] || null
             }));
 
@@ -99,7 +98,7 @@ async function attachVariantsToProducts(products) {
 router.get('/', async (req, res) => {
     try {
         const page = Math.max(parseInt(req.query.page) || 1, 1);
-        const limit = Math.max(parseInt(req.query.limit) || 5, 1);
+        const limit = Math.max(parseInt(req.query.limit) || 12, 1);
         const offset = (page - 1) * limit;
 
         const [totalResult] = await db.query('SELECT COUNT(*) AS total FROM productos');
@@ -226,8 +225,6 @@ router.get('/proveedor/:supplierId', async (req, res) => {
 
 // ========================
 // GET /productos/:id/variantes
-// Lista variantes activas. La imagen mostrada es la propia de la variante
-// si existe, o la imagen principal del producto como respaldo.
 // ========================
 router.get('/:id/variantes', async (req, res) => {
     try {
@@ -271,10 +268,33 @@ router.get('/:id/variantes', async (req, res) => {
 });
 
 // ========================
+// GET /productos/buscar-duplicado?name=&brand=
+// Consulta rápida (sin crear nada) para saber si ya existe un producto
+// con ese mismo nombre y marca. El frontend la puede usar mientras
+// el usuario escribe, además de la verificación que hace el POST.
+// ========================
+router.get('/buscar-duplicado', async (req, res) => {
+    try {
+        const { name, brand } = req.query;
+        if (!name) return res.json({ exists: false });
+
+        const [rows] = await db.query(
+            `SELECT id, name, brand FROM productos 
+             WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) 
+             AND (brand <=> ?) 
+             LIMIT 1`,
+            [name, brand ? brand.trim() : null]
+        );
+
+        res.json({ exists: rows.length > 0, product: rows[0] || null });
+    } catch (error) {
+        console.error('Error al buscar duplicado:', error);
+        res.status(500).json({ message: 'Error al verificar duplicados' });
+    }
+});
+
+// ========================
 // GET /productos/:id
-// Detalle completo: imágenes del producto (con ids, para editar/eliminar)
-// y variantes con SUS PROPIAS imágenes (overrides, sin fallback aquí,
-// para que el formulario de edición sepa qué es propio de la variante).
 // ========================
 router.get('/:id', async (req, res) => {
     try {
@@ -334,23 +354,18 @@ router.get('/:id', async (req, res) => {
 
 // ========================
 // POST /productos
-// Crea el producto, sus imágenes por defecto (OPCIONALES — principal,
-// hover y extra: úsalas solo cuando todas las variantes deben verse
-// igual, ej. tonos de maquillaje) y sus variantes (con imagen OPCIONAL,
-// para cuando la variante debe verse distinta al producto, ej. tamaños
-// de perfume, donde normalmente NO se sube imagen de producto y en su
-// lugar cada variante trae la suya).
-//
-// Campos: productName, productBrand, category_id, gender_id, productDescription
-// Archivos producto (opcionales): mainImage, hoverImage, extraImages (múltiples)
-// variants = JSON.stringify([{ index, variant_name, sale_price, quantity, barcode }])
-// Archivos por variante (opcionales): variantMain_{index}, variantHover_{index}, variantExtra_{index}
+// Antes de crear, verifica si ya existe un producto con el mismo
+// nombre + marca (comparación insensible a mayúsculas/espacios).
+// Si existe y no se envió force=true, responde 409 con los datos del
+// producto existente para que el usuario confirme si de verdad quiere
+// crear uno nuevo (ej. dos lotes distintos con el mismo nombre) o si
+// fue un error de captura.
 // ========================
 router.post('/', upload.any(), async (req, res) => {
     const connection = await db.getConnection();
 
     try {
-        const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
+        const { productName, productBrand, category_id, gender_id, productDescription, force } = req.body;
         const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
 
         if (!productName || !category_id) {
@@ -363,11 +378,25 @@ router.post('/', upload.any(), async (req, res) => {
             return res.status(400).json({ message: "Debe agregar al menos una variante." });
         }
 
-        // Las imágenes del producto (principal/hover/extra) son OPCIONALES.
-        // Úsalas cuando todas las variantes comparten la misma imagen
-        // (ej. tonos de maquillaje). Si cada variante necesita su propia
-        // foto (ej. tamaños de perfume), déjalas vacías y sube la imagen
-        // directamente en cada variante.
+        // ✅ Verificación de posible duplicado
+        if (force !== 'true') {
+            const [existing] = await connection.query(
+                `SELECT id, name, brand FROM productos 
+                 WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) 
+                 AND (brand <=> ?) 
+                 LIMIT 1`,
+                [productName, productBrand ? productBrand.trim() : null]
+            );
+
+            if (existing.length) {
+                connection.release();
+                return res.status(409).json({
+                    message: `Ya existe un producto llamado "${existing[0].name}"${existing[0].brand ? ' de la marca ' + existing[0].brand : ''}. ¿Seguro que deseas crear otro?`,
+                    existingProduct: existing[0]
+                });
+            }
+        }
+
         const mainFile = req.files.find(f => f.fieldname === 'mainImage');
         const hoverFile = req.files.find(f => f.fieldname === 'hoverImage');
 
@@ -381,7 +410,6 @@ router.post('/', upload.any(), async (req, res) => {
         const productId = insertResult.insertId;
         const productSlug = productName.replace(/\s+/g, '_').toLowerCase();
 
-        // ---- Imágenes del producto (por defecto, opcionales) ----
         if (mainFile) {
             const mainUpload = await uploadToCloudinary(mainFile.buffer, 'vansue/productos', `${productSlug}_main_${Date.now()}`, 400, 60);
             await connection.query(
@@ -407,7 +435,6 @@ router.post('/', upload.any(), async (req, res) => {
             );
         }
 
-        // ---- Variantes (imágenes OPCIONALES) ----
         for (const variant of variants) {
             const [variantResult] = await connection.query(
                 `INSERT INTO variantes (product_id, variant_name, sale_price, quantity, barcode) 
@@ -460,12 +487,6 @@ router.post('/', upload.any(), async (req, res) => {
 
 // ========================
 // PUT /productos/:id
-// Actualiza datos del producto, sus imágenes por defecto (reemplaza
-// principal/hover si se sube una nueva, agrega extras) y sus variantes.
-//
-// Campos extra: deleteProductImageIds (extras del producto a borrar),
-// deleteVariantImageIds (overrides de variante a borrar/revertir al
-// producto), deleteVariantIds (variantes completas a borrar)
 // ========================
 router.put('/:id', upload.any(), async (req, res) => {
     const connection = await db.getConnection();
@@ -500,7 +521,6 @@ router.put('/:id', upload.any(), async (req, res) => {
 
         const productSlug = productName.replace(/\s+/g, '_').toLowerCase();
 
-        // ---- Reemplazo opcional de imágenes del producto ----
         const mainFile = req.files.find(f => f.fieldname === 'mainImage');
         if (mainFile) {
             await connection.query(`DELETE FROM productos_imagenes WHERE product_id=? AND type='principal'`, [productId]);
@@ -521,7 +541,6 @@ router.put('/:id', upload.any(), async (req, res) => {
             await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'extra')`, [productId, up.secure_url]);
         }
 
-        // ---- Variantes ----
         for (const variant of variants) {
             let variantId = variant.id;
             const variantSlug = `${productSlug}_${variant.variant_name}`.replace(/\s+/g, '_').toLowerCase();

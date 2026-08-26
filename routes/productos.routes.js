@@ -16,6 +16,25 @@ function bufferToStream(buffer) {
     return stream;
 }
 
+// ========================
+// Slug seguro para Cloudinary: quita acentos/diacríticos y cualquier
+// carácter que no sea letra, número, guión o guión bajo. Antes solo se
+// reemplazaban espacios, así que un nombre con tilde o símbolo (ej.
+// "Édition", "50 ml!") producía un public_id inválido y Cloudinary
+// rechazaba el upload.
+// ========================
+function slugify(text) {
+    const base = (text || 'item')
+        .toString()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos: á->a, ñ->n, etc.
+        .replace(/[^a-zA-Z0-9\s_-]/g, '')                  // quita cualquier símbolo no permitido
+        .trim()
+        .replace(/\s+/g, '_')
+        .toLowerCase();
+
+    return base || 'item'; // por si el nombre queda vacío tras sanear (ej. era solo emojis)
+}
+
 async function uploadToCloudinary(buffer, folder, publicId, size = 400, quality = 60) {
     const resized = await sharp(buffer).resize(size, size).webp({ quality }).toBuffer();
     return new Promise((resolve, reject) => {
@@ -25,6 +44,21 @@ async function uploadToCloudinary(buffer, folder, publicId, size = 400, quality 
         );
         bufferToStream(resized).pipe(stream);
     });
+}
+
+// ========================
+// Borra de Cloudinary las imágenes ya subidas cuando algo falla después
+// (best-effort: si la limpieza misma falla, solo se registra en consola,
+// nunca se lanza el error hacia el cliente).
+// ========================
+async function cleanupUploads(publicIds) {
+    for (const publicId of publicIds) {
+        try {
+            await cloudinary.uploader.destroy(publicId, { resource_type: 'image' });
+        } catch (cleanupError) {
+            console.error(`⚠️ No se pudo limpiar la imagen huérfana ${publicId}:`, cleanupError.message);
+        }
+    }
 }
 
 function arrify(value) {
@@ -74,7 +108,6 @@ async function attachVariantsToProducts(products) {
             .filter(v => v.product_id === p.productId)
             .map(v => ({
                 ...v,
-                // imagen propia de la variante > imagen principal del producto > null
                 image: variantImageMap[v.id] || productMainImageMap[p.productId] || null
             }));
 
@@ -226,8 +259,6 @@ router.get('/proveedor/:supplierId', async (req, res) => {
 
 // ========================
 // GET /productos/:id/variantes
-// Lista variantes activas. La imagen mostrada es la propia de la variante
-// si existe, o la imagen principal del producto como respaldo.
 // ========================
 router.get('/:id/variantes', async (req, res) => {
     try {
@@ -272,9 +303,6 @@ router.get('/:id/variantes', async (req, res) => {
 
 // ========================
 // GET /productos/:id
-// Detalle completo: imágenes del producto (con ids, para editar/eliminar)
-// y variantes con SUS PROPIAS imágenes (overrides, sin fallback aquí,
-// para que el formulario de edición sepa qué es propio de la variante).
 // ========================
 router.get('/:id', async (req, res) => {
     try {
@@ -334,43 +362,104 @@ router.get('/:id', async (req, res) => {
 
 // ========================
 // POST /productos
-// Crea el producto, sus imágenes por defecto (OPCIONALES — principal,
-// hover y extra: úsalas solo cuando todas las variantes deben verse
-// igual, ej. tonos de maquillaje) y sus variantes (con imagen OPCIONAL,
-// para cuando la variante debe verse distinta al producto, ej. tamaños
-// de perfume, donde normalmente NO se sube imagen de producto y en su
-// lugar cada variante trae la suya).
+// FLUJO CORREGIDO (evita quemar IDs de MySQL con fallos de Cloudinary):
 //
-// Campos: productName, productBrand, category_id, gender_id, productDescription
-// Archivos producto (opcionales): mainImage, hoverImage, extraImages (múltiples)
-// variants = JSON.stringify([{ index, variant_name, sale_price, quantity, barcode }])
-// Archivos por variante (opcionales): variantMain_{index}, variantHover_{index}, variantExtra_{index}
+//   1. Validar datos (nombre, categoría, al menos 1 variante) → si falla,
+//      responde de una vez, sin tocar MySQL ni Cloudinary.
+//   2. Subir TODAS las imágenes a Cloudinary primero, con un slug seguro.
+//      Si cualquier subida falla, se limpian las que sí se subieron y se
+//      responde el error — MySQL nunca se toca, ningún AUTO_INCREMENT
+//      se pierde.
+//   3. Solo si el paso 2 fue 100% exitoso, se abre la transacción y se
+//      insertan producto, imágenes (ya con su URL) y variantes.
+//   4. Si algo falla en este paso (raro), se hace ROLLBACK en MySQL y se
+//      intenta borrar las imágenes ya subidas a Cloudinary, para no
+//      dejar archivos huérfanos.
 // ========================
 router.post('/', upload.any(), async (req, res) => {
+    const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
+    const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
+
+    // --- Paso 1: validar antes de tocar cualquier servicio externo ---
+    if (!productName || !category_id) {
+        return res.status(400).json({ message: "Nombre y categoría son obligatorios." });
+    }
+
+    if (!variants.length) {
+        return res.status(400).json({ message: "Debe agregar al menos una variante." });
+    }
+
+    for (const v of variants) {
+        if (!v.variant_name || v.sale_price === undefined || v.sale_price === null || v.sale_price === '') {
+            return res.status(400).json({ message: "Cada variante necesita nombre y precio de venta." });
+        }
+    }
+
+    const productSlug = slugify(productName);
+    const uploadedPublicIds = []; // para limpieza si algo falla después
+
+    let productMainUpload = null;
+    let productHoverUpload = null;
+    const productExtraUploads = [];
+    const variantUploads = {}; // { [index]: { main, hover, extras: [] } }
+
+    // --- Paso 2: subir TODAS las imágenes antes de tocar MySQL ---
+    try {
+        const mainFile = req.files.find(f => f.fieldname === 'mainImage');
+        if (mainFile) {
+            productMainUpload = await uploadToCloudinary(mainFile.buffer, 'vansue/productos', `${productSlug}_main_${Date.now()}`, 400, 60);
+            uploadedPublicIds.push(productMainUpload.public_id);
+        }
+
+        const hoverFile = req.files.find(f => f.fieldname === 'hoverImage');
+        if (hoverFile) {
+            productHoverUpload = await uploadToCloudinary(hoverFile.buffer, 'vansue/productos_hover', `${productSlug}_hover_${Date.now()}`, 400, 60);
+            uploadedPublicIds.push(productHoverUpload.public_id);
+        }
+
+        const productExtraFiles = req.files.filter(f => f.fieldname === 'extraImages');
+        for (let i = 0; i < productExtraFiles.length; i++) {
+            const up = await uploadToCloudinary(productExtraFiles[i].buffer, 'vansue/productos_extra', `${productSlug}_extra_${Date.now()}_${i}`, 600, 70);
+            uploadedPublicIds.push(up.public_id);
+            productExtraUploads.push(up);
+        }
+
+        for (const variant of variants) {
+            const variantSlug = `${productSlug}_${slugify(variant.variant_name)}`;
+            variantUploads[variant.index] = { main: null, hover: null, extras: [] };
+
+            const vMain = req.files.find(f => f.fieldname === `variantMain_${variant.index}`);
+            if (vMain) {
+                const up = await uploadToCloudinary(vMain.buffer, 'vansue/variantes', `${variantSlug}_main_${Date.now()}`, 400, 60);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].main = up;
+            }
+
+            const vHover = req.files.find(f => f.fieldname === `variantHover_${variant.index}`);
+            if (vHover) {
+                const up = await uploadToCloudinary(vHover.buffer, 'vansue/variantes_hover', `${variantSlug}_hover_${Date.now()}`, 400, 60);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].hover = up;
+            }
+
+            const vExtras = req.files.filter(f => f.fieldname === `variantExtra_${variant.index}`);
+            for (let i = 0; i < vExtras.length; i++) {
+                const up = await uploadToCloudinary(vExtras[i].buffer, 'vansue/variantes_extra', `${variantSlug}_extra_${Date.now()}_${i}`, 600, 70);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].extras.push(up);
+            }
+        }
+
+    } catch (uploadError) {
+        console.error('❌ Error al subir imágenes a Cloudinary:', uploadError);
+        await cleanupUploads(uploadedPublicIds);
+        return res.status(500).json({ message: `Error al subir imágenes: ${uploadError.message}` });
+    }
+
+    // --- Paso 3: todas las imágenes están arriba; ahora sí, MySQL ---
     const connection = await db.getConnection();
 
     try {
-        const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
-        const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
-
-        if (!productName || !category_id) {
-            connection.release();
-            return res.status(400).json({ message: "Nombre y categoría son obligatorios." });
-        }
-
-        if (!variants.length) {
-            connection.release();
-            return res.status(400).json({ message: "Debe agregar al menos una variante." });
-        }
-
-        // Las imágenes del producto (principal/hover/extra) son OPCIONALES.
-        // Úsalas cuando todas las variantes comparten la misma imagen
-        // (ej. tonos de maquillaje). Si cada variante necesita su propia
-        // foto (ej. tamaños de perfume), déjalas vacías y sube la imagen
-        // directamente en cada variante.
-        const mainFile = req.files.find(f => f.fieldname === 'mainImage');
-        const hoverFile = req.files.find(f => f.fieldname === 'hoverImage');
-
         await connection.beginTransaction();
 
         const [insertResult] = await connection.query(
@@ -379,35 +468,28 @@ router.post('/', upload.any(), async (req, res) => {
         );
 
         const productId = insertResult.insertId;
-        const productSlug = productName.replace(/\s+/g, '_').toLowerCase();
 
-        // ---- Imágenes del producto (por defecto, opcionales) ----
-        if (mainFile) {
-            const mainUpload = await uploadToCloudinary(mainFile.buffer, 'vansue/productos', `${productSlug}_main_${Date.now()}`, 400, 60);
+        if (productMainUpload) {
             await connection.query(
                 `INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'principal')`,
-                [productId, mainUpload.secure_url]
+                [productId, productMainUpload.secure_url]
             );
         }
 
-        if (hoverFile) {
-            const hoverUpload = await uploadToCloudinary(hoverFile.buffer, 'vansue/productos_hover', `${productSlug}_hover_${Date.now()}`, 400, 60);
+        if (productHoverUpload) {
             await connection.query(
                 `INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'hover')`,
-                [productId, hoverUpload.secure_url]
+                [productId, productHoverUpload.secure_url]
             );
         }
 
-        const productExtraFiles = req.files.filter(f => f.fieldname === 'extraImages');
-        for (let i = 0; i < productExtraFiles.length; i++) {
-            const extraUpload = await uploadToCloudinary(productExtraFiles[i].buffer, 'vansue/productos_extra', `${productSlug}_extra_${Date.now()}_${i}`, 600, 70);
+        for (const up of productExtraUploads) {
             await connection.query(
                 `INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'extra')`,
-                [productId, extraUpload.secure_url]
+                [productId, up.secure_url]
             );
         }
 
-        // ---- Variantes (imágenes OPCIONALES) ----
         for (const variant of variants) {
             const [variantResult] = await connection.query(
                 `INSERT INTO variantes (product_id, variant_name, sale_price, quantity, barcode) 
@@ -416,29 +498,23 @@ router.post('/', upload.any(), async (req, res) => {
             );
 
             const variantId = variantResult.insertId;
-            const variantSlug = `${productSlug}_${variant.variant_name}`.replace(/\s+/g, '_').toLowerCase();
+            const uploads = variantUploads[variant.index];
 
-            const vMain = req.files.find(f => f.fieldname === `variantMain_${variant.index}`);
-            if (vMain) {
-                const up = await uploadToCloudinary(vMain.buffer, 'vansue/variantes', `${variantSlug}_main_${Date.now()}`, 400, 60);
+            if (uploads.main) {
                 await connection.query(
                     `INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'principal')`,
-                    [variantId, up.secure_url]
+                    [variantId, uploads.main.secure_url]
                 );
             }
 
-            const vHover = req.files.find(f => f.fieldname === `variantHover_${variant.index}`);
-            if (vHover) {
-                const up = await uploadToCloudinary(vHover.buffer, 'vansue/variantes_hover', `${variantSlug}_hover_${Date.now()}`, 400, 60);
+            if (uploads.hover) {
                 await connection.query(
                     `INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'hover')`,
-                    [variantId, up.secure_url]
+                    [variantId, uploads.hover.secure_url]
                 );
             }
 
-            const vExtras = req.files.filter(f => f.fieldname === `variantExtra_${variant.index}`);
-            for (let i = 0; i < vExtras.length; i++) {
-                const up = await uploadToCloudinary(vExtras[i].buffer, 'vansue/variantes_extra', `${variantSlug}_extra_${Date.now()}_${i}`, 600, 70);
+            for (const up of uploads.extras) {
                 await connection.query(
                     `INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'extra')`,
                     [variantId, up.secure_url]
@@ -449,9 +525,11 @@ router.post('/', upload.any(), async (req, res) => {
         await connection.commit();
         res.status(201).json({ message: 'Producto y variantes registrados correctamente', productId });
 
-    } catch (err) {
+    } catch (dbError) {
         await connection.rollback();
-        console.error('Error al registrar producto:', err);
+        console.error('❌ Error al registrar producto en la base de datos:', dbError);
+        // Las imágenes ya están en Cloudinary pero el producto no se guardó: limpiamos para no dejar huérfanos.
+        await cleanupUploads(uploadedPublicIds);
         res.status(500).json({ message: 'Error al registrar el producto' });
     } finally {
         connection.release();
@@ -460,25 +538,88 @@ router.post('/', upload.any(), async (req, res) => {
 
 // ========================
 // PUT /productos/:id
-// Actualiza datos del producto, sus imágenes por defecto (reemplaza
-// principal/hover si se sube una nueva, agrega extras) y sus variantes.
-//
-// Campos extra: deleteProductImageIds (extras del producto a borrar),
-// deleteVariantImageIds (overrides de variante a borrar/revertir al
-// producto), deleteVariantIds (variantes completas a borrar)
+// Mismo principio: subir imágenes nuevas primero, y solo si todo sale
+// bien, aplicar los cambios en MySQL. Así una variante nueva agregada
+// durante una edición tampoco quema su ID si Cloudinary falla.
 // ========================
 router.put('/:id', upload.any(), async (req, res) => {
+    const productId = req.params.id;
+    const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
+    const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
+
+    const deleteVariantIds = arrify(req.body.deleteVariantIds);
+    const deleteProductImageIds = arrify(req.body.deleteProductImageIds);
+    const deleteVariantImageIds = arrify(req.body.deleteVariantImageIds);
+
+    if (!productName || !category_id) {
+        return res.status(400).json({ message: "Nombre y categoría son obligatorios." });
+    }
+
+    const productSlug = slugify(productName);
+    const uploadedPublicIds = [];
+
+    let productMainUpload = null;
+    let productHoverUpload = null;
+    const productExtraUploads = [];
+    const variantUploads = {};
+
+    // --- Subir imágenes nuevas primero ---
+    try {
+        const mainFile = req.files.find(f => f.fieldname === 'mainImage');
+        if (mainFile) {
+            productMainUpload = await uploadToCloudinary(mainFile.buffer, 'vansue/productos', `${productSlug}_main_${Date.now()}`, 400, 60);
+            uploadedPublicIds.push(productMainUpload.public_id);
+        }
+
+        const hoverFile = req.files.find(f => f.fieldname === 'hoverImage');
+        if (hoverFile) {
+            productHoverUpload = await uploadToCloudinary(hoverFile.buffer, 'vansue/productos_hover', `${productSlug}_hover_${Date.now()}`, 400, 60);
+            uploadedPublicIds.push(productHoverUpload.public_id);
+        }
+
+        const productExtraFiles = req.files.filter(f => f.fieldname === 'extraImages');
+        for (let i = 0; i < productExtraFiles.length; i++) {
+            const up = await uploadToCloudinary(productExtraFiles[i].buffer, 'vansue/productos_extra', `${productSlug}_extra_${Date.now()}_${i}`, 600, 70);
+            uploadedPublicIds.push(up.public_id);
+            productExtraUploads.push(up);
+        }
+
+        for (const variant of variants) {
+            const variantSlug = `${productSlug}_${slugify(variant.variant_name)}`;
+            variantUploads[variant.index] = { main: null, hover: null, extras: [] };
+
+            const vMain = req.files.find(f => f.fieldname === `variantMain_${variant.index}`);
+            if (vMain) {
+                const up = await uploadToCloudinary(vMain.buffer, 'vansue/variantes', `${variantSlug}_main_${Date.now()}`, 400, 60);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].main = up;
+            }
+
+            const vHover = req.files.find(f => f.fieldname === `variantHover_${variant.index}`);
+            if (vHover) {
+                const up = await uploadToCloudinary(vHover.buffer, 'vansue/variantes_hover', `${variantSlug}_hover_${Date.now()}`, 400, 60);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].hover = up;
+            }
+
+            const vExtras = req.files.filter(f => f.fieldname === `variantExtra_${variant.index}`);
+            for (let i = 0; i < vExtras.length; i++) {
+                const up = await uploadToCloudinary(vExtras[i].buffer, 'vansue/variantes_extra', `${variantSlug}_extra_${Date.now()}_${i}`, 600, 70);
+                uploadedPublicIds.push(up.public_id);
+                variantUploads[variant.index].extras.push(up);
+            }
+        }
+
+    } catch (uploadError) {
+        console.error('❌ Error al subir imágenes a Cloudinary:', uploadError);
+        await cleanupUploads(uploadedPublicIds);
+        return res.status(500).json({ message: `Error al subir imágenes: ${uploadError.message}` });
+    }
+
+    // --- Ahora sí, aplicar cambios en MySQL ---
     const connection = await db.getConnection();
 
     try {
-        const productId = req.params.id;
-        const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
-        const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
-
-        const deleteVariantIds = arrify(req.body.deleteVariantIds);
-        const deleteProductImageIds = arrify(req.body.deleteProductImageIds);
-        const deleteVariantImageIds = arrify(req.body.deleteVariantImageIds);
-
         await connection.beginTransaction();
 
         await connection.query(
@@ -498,33 +639,22 @@ router.put('/:id', upload.any(), async (req, res) => {
             await connection.query(`DELETE FROM variantes_imagenes WHERE id IN (?)`, [deleteVariantImageIds]);
         }
 
-        const productSlug = productName.replace(/\s+/g, '_').toLowerCase();
-
-        // ---- Reemplazo opcional de imágenes del producto ----
-        const mainFile = req.files.find(f => f.fieldname === 'mainImage');
-        if (mainFile) {
+        if (productMainUpload) {
             await connection.query(`DELETE FROM productos_imagenes WHERE product_id=? AND type='principal'`, [productId]);
-            const up = await uploadToCloudinary(mainFile.buffer, 'vansue/productos', `${productSlug}_main_${Date.now()}`, 400, 60);
-            await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'principal')`, [productId, up.secure_url]);
+            await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'principal')`, [productId, productMainUpload.secure_url]);
         }
 
-        const hoverFile = req.files.find(f => f.fieldname === 'hoverImage');
-        if (hoverFile) {
+        if (productHoverUpload) {
             await connection.query(`DELETE FROM productos_imagenes WHERE product_id=? AND type='hover'`, [productId]);
-            const up = await uploadToCloudinary(hoverFile.buffer, 'vansue/productos_hover', `${productSlug}_hover_${Date.now()}`, 400, 60);
-            await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'hover')`, [productId, up.secure_url]);
+            await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'hover')`, [productId, productHoverUpload.secure_url]);
         }
 
-        const productExtraFiles = req.files.filter(f => f.fieldname === 'extraImages');
-        for (let i = 0; i < productExtraFiles.length; i++) {
-            const up = await uploadToCloudinary(productExtraFiles[i].buffer, 'vansue/productos_extra', `${productSlug}_extra_${Date.now()}_${i}`, 600, 70);
+        for (const up of productExtraUploads) {
             await connection.query(`INSERT INTO productos_imagenes (product_id, image, type) VALUES (?, ?, 'extra')`, [productId, up.secure_url]);
         }
 
-        // ---- Variantes ----
         for (const variant of variants) {
             let variantId = variant.id;
-            const variantSlug = `${productSlug}_${variant.variant_name}`.replace(/\s+/g, '_').toLowerCase();
 
             if (variantId) {
                 await connection.query(
@@ -540,23 +670,19 @@ router.put('/:id', upload.any(), async (req, res) => {
                 variantId = variantResult.insertId;
             }
 
-            const vMain = req.files.find(f => f.fieldname === `variantMain_${variant.index}`);
-            if (vMain) {
+            const uploads = variantUploads[variant.index];
+
+            if (uploads.main) {
                 await connection.query(`DELETE FROM variantes_imagenes WHERE variant_id=? AND type='principal'`, [variantId]);
-                const up = await uploadToCloudinary(vMain.buffer, 'vansue/variantes', `${variantSlug}_main_${Date.now()}`, 400, 60);
-                await connection.query(`INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'principal')`, [variantId, up.secure_url]);
+                await connection.query(`INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'principal')`, [variantId, uploads.main.secure_url]);
             }
 
-            const vHover = req.files.find(f => f.fieldname === `variantHover_${variant.index}`);
-            if (vHover) {
+            if (uploads.hover) {
                 await connection.query(`DELETE FROM variantes_imagenes WHERE variant_id=? AND type='hover'`, [variantId]);
-                const up = await uploadToCloudinary(vHover.buffer, 'vansue/variantes_hover', `${variantSlug}_hover_${Date.now()}`, 400, 60);
-                await connection.query(`INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'hover')`, [variantId, up.secure_url]);
+                await connection.query(`INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'hover')`, [variantId, uploads.hover.secure_url]);
             }
 
-            const vExtras = req.files.filter(f => f.fieldname === `variantExtra_${variant.index}`);
-            for (let i = 0; i < vExtras.length; i++) {
-                const up = await uploadToCloudinary(vExtras[i].buffer, 'vansue/variantes_extra', `${variantSlug}_extra_${Date.now()}_${i}`, 600, 70);
+            for (const up of uploads.extras) {
                 await connection.query(`INSERT INTO variantes_imagenes (variant_id, image, type) VALUES (?, ?, 'extra')`, [variantId, up.secure_url]);
             }
         }
@@ -564,9 +690,10 @@ router.put('/:id', upload.any(), async (req, res) => {
         await connection.commit();
         res.status(200).send("Producto actualizado correctamente");
 
-    } catch (err) {
+    } catch (dbError) {
         await connection.rollback();
-        console.error(err);
+        console.error('❌ Error al actualizar producto en la base de datos:', dbError);
+        await cleanupUploads(uploadedPublicIds);
         res.status(500).send("Error al actualizar el producto");
     } finally {
         connection.release();

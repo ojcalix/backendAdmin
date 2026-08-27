@@ -70,8 +70,14 @@ router.get('/:id', async (req, res) => {
 router.post('/', async (req, res) => {
     let { first_name, last_name, email, phone } = req.body;
 
-    if (email && email.trim() === '') {
+    // ✅ CORREGIDO: antes era "email && email.trim() === ''", pero un
+    // string vacío ('') ya es falso por sí mismo, así que ese "&&" nunca
+    // dejaba pasar a comprobar el trim(). Con "!email ||" cubrimos tanto
+    // el caso de string vacío como el de solo espacios en blanco.
+    if (!email || email.trim() === '') {
         email = null;
+    } else {
+        email = email.trim();
     }
 
     try {
@@ -84,6 +90,12 @@ router.post('/', async (req, res) => {
 
     } catch (err) {
         console.error('Error en la consulta SQL:', err);
+
+        // ✅ Mensaje más claro si el correo ya existe (para futuros casos reales de duplicado)
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un cliente registrado con ese correo.' });
+        }
+
         res.status(500).send('Error al agregar cliente');
     }
 });
@@ -94,7 +106,15 @@ router.post('/', async (req, res) => {
 // ========================
 router.put('/:id', async (req, res) => {
     const customerId = req.params.id;
-    const { first_name, last_name, email, phone } = req.body;
+    let { first_name, last_name, email, phone } = req.body;
+
+    // ✅ Misma corrección aquí, para que editar un cliente y borrarle
+    // el correo tampoco choque con el mismo bug.
+    if (!email || email.trim() === '') {
+        email = null;
+    } else {
+        email = email.trim();
+    }
 
     try {
         await db.query(
@@ -106,6 +126,11 @@ router.put('/:id', async (req, res) => {
 
     } catch (err) {
         console.error('Error al actualizar el cliente:', err);
+
+        if (err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Ya existe un cliente registrado con ese correo.' });
+        }
+
         res.status(500).send('Error al actualizar el cliente');
     }
 });

@@ -48,6 +48,12 @@ router.get('/actual', async (req, res) => {
 
 // ========================
 // POST /caja/abrir
+// Si es la PRIMERA caja que este usuario abre en toda la vida del
+// sistema (no tiene ninguna caja previa, abierta o cerrada), el monto
+// inicial se reconoce automáticamente en la contabilidad como el
+// efectivo que el negocio ya tenía antes de empezar a usar Vansue.
+// Cualquier apertura posterior es solo continuidad operativa (lo que
+// quedó ayer) y NO genera un asiento nuevo — ya está contabilizado.
 // ========================
 router.post('/abrir', async (req, res) => {
     const { user_id, opening_amount } = req.body;
@@ -56,26 +62,55 @@ router.post('/abrir', async (req, res) => {
         return res.status(400).json({ error: "Datos incompletos o monto inválido." });
     }
 
+    const connection = await db.getConnection();
+
     try {
-        const [existing] = await db.query(
+        await connection.beginTransaction();
+
+        const [existing] = await connection.query(
             "SELECT id FROM cajas WHERE user_id = ? AND status = 'open'",
             [user_id]
         );
 
         if (existing.length) {
+            await connection.rollback();
             return res.status(400).json({ error: "Ya tienes una caja abierta. Ciérrala antes de abrir otra." });
         }
 
-        const [result] = await db.query(
+        // ✅ ¿Es la primera caja de este usuario en toda la historia?
+        const [anyPreviousCaja] = await connection.query(
+            "SELECT id FROM cajas WHERE user_id = ? LIMIT 1",
+            [user_id]
+        );
+        const esPrimeraCaja = anyPreviousCaja.length === 0;
+
+        const [result] = await connection.query(
             "INSERT INTO cajas (user_id, opening_amount, status) VALUES (?, ?, 'open')",
             [user_id, opening_amount]
         );
 
+        if (esPrimeraCaja && parseFloat(opening_amount) > 0) {
+            await crearAsiento(connection, {
+                description: `Apertura de caja #${result.insertId}: reconocimiento de saldo inicial de efectivo`,
+                reference_type: 'apertura_caja',
+                reference_id: result.insertId,
+                user_id,
+                lines: [
+                    { code: '1101', debit: opening_amount },
+                    { code: '3101', credit: opening_amount }
+                ]
+            });
+        }
+
+        await connection.commit();
         res.json({ message: "Caja abierta con éxito", caja_id: result.insertId });
 
     } catch (error) {
+        await connection.rollback();
         console.error("❌ Error al abrir caja:", error);
         res.status(500).json({ error: "Error al abrir la caja" });
+    } finally {
+        connection.release();
     }
 });
 

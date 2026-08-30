@@ -5,7 +5,6 @@ const { crearAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /bancos
-// Lista todas las cuentas bancarias
 // ========================
 router.get('/', async (req, res) => {
     try {
@@ -21,33 +20,60 @@ router.get('/', async (req, res) => {
 
 // ========================
 // POST /bancos
-// Crea una nueva cuenta bancaria con saldo inicial
+// Crea una nueva cuenta bancaria con saldo inicial. Como una cuenta
+// nunca se "reabre" (a diferencia de la caja diaria), CUALQUIER saldo
+// inicial > 0 al crearla representa dinero real que ya existía y debe
+// reconocerse en la contabilidad — no requiere lógica de "primera vez".
 // ========================
 router.post('/', async (req, res) => {
-    const { bank_name, account_number, account_alias, initial_balance } = req.body;
+    const { bank_name, account_number, account_alias, initial_balance, user_id } = req.body;
 
     if (!bank_name || !account_number) {
         return res.status(400).json({ error: "Banco y número de cuenta son obligatorios." });
     }
 
+    if (parseFloat(initial_balance || 0) > 0 && !user_id) {
+        return res.status(400).json({ error: "Falta el usuario para registrar el saldo inicial." });
+    }
+
+    const connection = await db.getConnection();
+
     try {
-        const [result] = await db.query(
+        await connection.beginTransaction();
+
+        const [result] = await connection.query(
             `INSERT INTO bancos (bank_name, account_number, account_alias, current_balance) 
              VALUES (?, ?, ?, ?)`,
             [bank_name, account_number, account_alias || null, initial_balance || 0]
         );
 
+        if (parseFloat(initial_balance || 0) > 0) {
+            await crearAsiento(connection, {
+                description: `Apertura de cuenta bancaria "${bank_name}": reconocimiento de saldo inicial`,
+                reference_type: 'ajuste',
+                reference_id: result.insertId,
+                user_id,
+                lines: [
+                    { code: '1102', debit: initial_balance },
+                    { code: '3101', credit: initial_balance }
+                ]
+            });
+        }
+
+        await connection.commit();
         res.json({ message: "Cuenta bancaria agregada con éxito", bank_id: result.insertId });
 
     } catch (error) {
+        await connection.rollback();
         console.error("❌ Error al agregar cuenta bancaria:", error);
         res.status(500).json({ error: "Error al agregar la cuenta bancaria" });
+    } finally {
+        connection.release();
     }
 });
 
 // ========================
 // PUT /bancos/:id/estado
-// Activa o desactiva una cuenta bancaria
 // ========================
 router.put('/:id/estado', async (req, res) => {
     const { id } = req.params;
@@ -78,7 +104,6 @@ router.put('/:id/estado', async (req, res) => {
 
 // ========================
 // GET /bancos/:id/movimientos
-// Lista los movimientos de una cuenta bancaria
 // ========================
 router.get('/:id/movimientos', async (req, res) => {
     const { id } = req.params;
@@ -98,7 +123,6 @@ router.get('/:id/movimientos', async (req, res) => {
 
 // ========================
 // POST /bancos/movimiento-manual
-// Registra un depósito o retiro manual, validando saldo si es retiro
 // ========================
 router.post('/movimiento-manual', async (req, res) => {
     const { bank_id, type, amount, concept, affects_caja, user_id } = req.body;
@@ -115,7 +139,6 @@ router.post('/movimiento-manual', async (req, res) => {
         return res.status(400).json({ error: "Falta el usuario que registra el movimiento." });
     }
 
-    // ✅ Con pool, las transacciones necesitan una conexión dedicada
     const connection = await db.getConnection();
 
     try {
@@ -177,14 +200,12 @@ router.post('/movimiento-manual', async (req, res) => {
             }
         }
 
-        // ✅ Insertar el movimiento bancario
         const [movBancoResult] = await connection.query(
             `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type) 
              VALUES (?, ?, ?, ?, 'otro')`,
             [bank_id, type, amount, concept]
         );
 
-        // ✅ Insertar el movimiento espejo en caja, si aplica
         if (cajaAbierta) {
             const cajaType = type === 'deposit' ? 'expense' : 'income';
             const cajaConcept = type === 'deposit'
@@ -198,7 +219,6 @@ router.post('/movimiento-manual', async (req, res) => {
             );
         }
 
-        // ✅ Actualizar el saldo de la cuenta bancaria
         const newBalance = type === 'deposit'
             ? parseFloat(bank.current_balance) + parseFloat(amount)
             : parseFloat(bank.current_balance) - parseFloat(amount);
@@ -208,7 +228,6 @@ router.post('/movimiento-manual', async (req, res) => {
             [newBalance, bank_id]
         );
 
-        // ✅ Generar asiento contable
         if (affects_caja) {
             await crearAsiento(connection, {
                 description: type === 'deposit' ? `Depósito a banco: ${concept}` : `Retiro de banco: ${concept}`,

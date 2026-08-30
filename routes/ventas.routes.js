@@ -401,7 +401,6 @@ router.post('/rapida', async (req, res) => {
         connection.release();
     }
 });
-
 // ========================
 // GET /ventas/:id
 // ========================

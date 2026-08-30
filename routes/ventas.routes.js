@@ -248,6 +248,161 @@ router.get('/', async (req, res) => {
 });
 
 // ========================
+// POST /ventas/rapida
+// Registra una venta SIN inventario asociado — para productos que aún
+// no están cargados en el sistema (ej. maquillaje en tránsito de subir).
+// A diferencia de una venta normal: no descuenta stock, no genera
+// puntos (no hay producto para calcular el margen), no requiere
+// productos[]. SÍ exige caja abierta igual que cualquier venta, y SÍ
+// genera el asiento correcto contra Ventas (4101) — así el ingreso
+// aparece en el Estado de Resultados donde debe estar, no como
+// "Otros Ingresos".
+//
+// Cuando subas el inventario real de esos productos, esta venta queda
+// como está — no hace falta "corregirla" ni migrarla, es historia.
+// ========================
+router.post('/rapida', async (req, res) => {
+    const {
+        user_id,
+        customer_id,
+        payment_type,
+        payment_status,
+        payment_method,
+        bank_id,
+        total,
+        paid_amount,
+        pending_amount,
+        concept
+    } = req.body;
+
+    if (!user_id || !total || total <= 0) {
+        return res.status(400).json({ error: "Usuario y un monto válido son obligatorios." });
+    }
+
+    const validPaymentTypes = ['cash', 'credit', 'mixed'];
+    if (!validPaymentTypes.includes(payment_type)) {
+        return res.status(400).json({ error: "Forma de pago inválida." });
+    }
+
+    if ((payment_type === 'credit' || payment_type === 'mixed') && !customer_id) {
+        return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
+    }
+
+    const normalizedPaymentMethod = payment_method || 'cash';
+    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+
+    if (entraDinero) {
+        const validMethods = ['cash', 'transfer', 'card'];
+        if (!validMethods.includes(normalizedPaymentMethod)) {
+            return res.status(400).json({ error: "Método de pago inválido." });
+        }
+        if ((normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') && !bank_id) {
+            return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
+        }
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        let cajaAbierta = null;
+        let bankAccount = null;
+
+        // ✅ Caja abierta obligatoria, igual que cualquier venta
+        const [cajaResult] = await connection.query(
+            "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
+            [user_id]
+        );
+
+        if (!cajaResult.length) {
+            await connection.rollback();
+            return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas." });
+        }
+
+        cajaAbierta = cajaResult[0];
+
+        if (entraDinero && (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card')) {
+            const [bankResult] = await connection.query(
+                "SELECT id FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
+                [bank_id]
+            );
+
+            if (!bankResult.length) {
+                await connection.rollback();
+                return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
+            }
+
+            bankAccount = bankResult[0];
+        }
+
+        // ✅ Venta sin productos — earned_points siempre 0 porque no hay
+        // forma de calcular margen sin costo de inventario conocido
+        const [ventaResult] = await connection.query(
+            `INSERT INTO ventas 
+                (user_id, customer_id, payment_type, payment_status, payment_method, bank_id, total, paid_amount, pending_amount, earned_points) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+            [user_id, customer_id || null, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, total, paid_amount, pending_amount]
+        );
+        const sale_id = ventaResult.insertId;
+
+        const conceptoFinal = concept?.trim() || `Venta #${sale_id} sin inventario cargado`;
+
+        if (entraDinero && normalizedPaymentMethod === 'cash') {
+            await connection.query(
+                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                 VALUES (?, 'income', ?, ?, 'venta', ?)`,
+                [cajaAbierta.id, conceptoFinal, paid_amount, sale_id]
+            );
+        }
+
+        if (bankAccount) {
+            await connection.query(
+                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'transfer_in', ?, ?, 'venta', ?)`,
+                [bank_id, paid_amount, conceptoFinal, sale_id]
+            );
+
+            await connection.query(
+                "UPDATE bancos SET current_balance = current_balance + ? WHERE id = ?",
+                [paid_amount, bank_id]
+            );
+        }
+
+        // ✅ Asiento: va a 4101 - Ventas, exactamente como una venta normal.
+        // Sin línea de Costo de Ventas (5101) porque no conocemos el costo
+        // real de esa mercancía todavía.
+        const cuentaDinero = normalizedPaymentMethod === 'cash' ? '1101' : '1102';
+        const lines = [{ code: '4101', credit: total }];
+
+        if (paid_amount > 0) {
+            lines.push({ code: cuentaDinero, debit: paid_amount });
+        }
+        if (pending_amount > 0) {
+            lines.push({ code: '1103', debit: pending_amount });
+        }
+
+        await crearAsiento(connection, {
+            description: conceptoFinal,
+            reference_type: 'venta',
+            reference_id: sale_id,
+            user_id,
+            lines
+        });
+
+        await connection.commit();
+        res.json({ message: "Venta registrada con éxito (sin inventario)", sale_id });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("❌ Error al registrar venta rápida:", error);
+        res.status(500).json({ error: "Error al registrar la venta" });
+    } finally {
+        connection.release();
+    }
+});
+
+// ========================
 // GET /ventas/:id
 // ========================
 router.get('/:id', async (req, res) => {

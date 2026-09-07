@@ -132,7 +132,8 @@ router.post('/', async (req, res) => {
             );
         }
 
-        let totalEarnedPoints = 0;
+                let totalEarnedPoints = 0;
+        let totalCostOfGoods = 0;
 
         for (const product of products) {
             const { product_id, variant_id, quantity, subtotal } = product;
@@ -143,7 +144,7 @@ router.post('/', async (req, res) => {
             }
 
             const [variantStockResult] = await connection.query(
-                "SELECT quantity FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+                "SELECT quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
                 [variant_id, product_id]
             );
 
@@ -151,6 +152,11 @@ router.post('/', async (req, res) => {
                 await connection.rollback();
                 return res.status(400).json({ error: `Stock insuficiente o variante no encontrada (ID: ${variant_id})` });
             }
+
+            // ✅ Costo de lo vendido, usando el promedio ponderado de la
+            // variante. Esto es lo que hace falta para poder generar el
+            // asiento de Costo de Ventas / Inventario más abajo.
+            totalCostOfGoods += parseFloat(variantStockResult[0].average_cost) * parseInt(quantity);
 
             await connection.query(
                 "UPDATE variantes SET quantity = quantity - ? WHERE id = ?",
@@ -198,6 +204,14 @@ router.post('/', async (req, res) => {
         }
         if (pending_amount > 0) {
             lines.push({ code: '1103', debit: pending_amount });
+        }
+
+        // ✅ Costo de Ventas / Inventario — sin esto, el inventario nunca
+        // baja contablemente y la utilidad queda inflada por el valor
+        // total de la venta, sin descontar el costo de la mercancía.
+        if (totalCostOfGoods > 0) {
+            lines.push({ code: '5101', debit: totalCostOfGoods });
+            lines.push({ code: '1104', credit: totalCostOfGoods });
         }
 
         await crearAsiento(connection, {

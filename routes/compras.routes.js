@@ -65,25 +65,33 @@ router.post('/apertura', async (req, res) => {
         const purchase_id = compraResult.insertId;
 
         for (const p of products) {
-            const [variantExists] = await connection.query(
-                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+            const [variantRows] = await connection.query(
+                "SELECT id, quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
                 [p.variant_id, p.product_id]
             );
 
-            if (!variantExists.length) {
+            if (!variantRows.length) {
                 await connection.rollback();
                 return res.status(400).json({ error: `Variante no encontrada (ID: ${p.variant_id})` });
             }
 
+            const variant = variantRows[0];
+            const oldQty = parseInt(variant.quantity);
+            const oldCost = parseFloat(variant.average_cost);
+            const newQty = oldQty + parseInt(p.quantity);
+            const newAvgCost = newQty > 0
+                ? ((oldQty * oldCost) + (parseInt(p.quantity) * parseFloat(p.purchase_price))) / newQty
+                : 0;
+
             await connection.query(
                 `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-                 VALUES (?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?)`,
                 [purchase_id, p.product_id, p.variant_id, p.quantity, p.purchase_price]
             );
 
             await connection.query(
-                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
-                [p.quantity, p.variant_id]
+                "UPDATE variantes SET quantity = ?, average_cost = ? WHERE id = ?",
+                [newQty, newAvgCost, p.variant_id]
             );
         }
 
@@ -301,25 +309,33 @@ router.post('/', async (req, res) => {
                 return res.status(400).json({ error: `Falta la variante para el producto (ID: ${product_id})` });
             }
 
-            const [variantExists] = await connection.query(
-                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+            const [variantRows] = await connection.query(
+                "SELECT id, quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
                 [variant_id, product_id]
             );
 
-            if (!variantExists.length) {
+            if (!variantRows.length) {
                 await connection.rollback();
                 return res.status(400).json({ error: `Variante no encontrada (ID: ${variant_id})` });
             }
 
+            const variant = variantRows[0];
+            const oldQty = parseInt(variant.quantity);
+            const oldCost = parseFloat(variant.average_cost);
+            const newQty = oldQty + parseInt(quantity);
+            const newAvgCost = newQty > 0
+                ? ((oldQty * oldCost) + (parseInt(quantity) * parseFloat(linePrice))) / newQty
+                : 0;
+
             await connection.query(
                 `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-                 VALUES (?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?)`,
                 [purchase_id, product_id, variant_id, quantity, linePrice]
             );
 
             await connection.query(
-                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
-                [quantity, variant_id]
+                "UPDATE variantes SET quantity = ?, average_cost = ? WHERE id = ?",
+                [newQty, newAvgCost, variant_id]
             );
         }
 

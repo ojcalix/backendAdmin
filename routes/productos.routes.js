@@ -128,6 +128,7 @@ async function attachVariantsToProducts(products) {
 
 // ========================
 // GET /productos?page=&limit=
+// Solo productos activos.
 // ========================
 router.get('/', async (req, res) => {
     try {
@@ -135,7 +136,9 @@ router.get('/', async (req, res) => {
         const limit = Math.max(parseInt(req.query.limit) || 5, 1);
         const offset = (page - 1) * limit;
 
-        const [totalResult] = await db.query('SELECT COUNT(*) AS total FROM productos');
+        const [totalResult] = await db.query(
+            "SELECT COUNT(*) AS total FROM productos WHERE status = 'active'"
+        );
         const total = totalResult[0].total;
         const totalPages = Math.ceil(total / limit);
 
@@ -149,6 +152,7 @@ router.get('/', async (req, res) => {
                 p.registration_date AS createdAt
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
+            WHERE p.status = 'active'
             ORDER BY p.registration_date DESC
             LIMIT ? OFFSET ?
         `, [limit, offset]);
@@ -165,6 +169,7 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /productos/todos
+// Solo productos activos.
 // ========================
 router.get('/todos', async (req, res) => {
     try {
@@ -184,6 +189,7 @@ router.get('/todos', async (req, res) => {
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
             LEFT JOIN variantes v ON v.product_id = p.id AND v.status = 'active'
+            WHERE p.status = 'active'
             GROUP BY p.id
             ORDER BY p.name ASC
         `);
@@ -196,6 +202,7 @@ router.get('/todos', async (req, res) => {
 
 // ========================
 // GET /productos/buscar/:termino
+// Solo productos activos.
 // ========================
 router.get('/buscar/:termino', async (req, res) => {
     const { termino } = req.params;
@@ -211,9 +218,10 @@ router.get('/buscar/:termino', async (req, res) => {
                 p.registration_date AS createdAt
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
-            WHERE p.name LIKE ? OR p.id = ? OR EXISTS (
+            WHERE p.status = 'active'
+              AND (p.name LIKE ? OR p.id = ? OR EXISTS (
                 SELECT 1 FROM variantes v3 WHERE v3.product_id = p.id AND v3.barcode = ?
-            )
+              ))
             ORDER BY p.name ASC
         `, [`%${termino}%`, termino, termino]);
 
@@ -228,6 +236,7 @@ router.get('/buscar/:termino', async (req, res) => {
 
 // ========================
 // GET /productos/proveedor/:supplierId
+// Solo productos activos.
 // ========================
 router.get('/proveedor/:supplierId', async (req, res) => {
     try {
@@ -245,7 +254,7 @@ router.get('/proveedor/:supplierId', async (req, res) => {
             FROM producto_proveedor pp
             INNER JOIN productos p ON p.id = pp.product_id
             LEFT JOIN categorias c ON c.id = p.category_id
-            WHERE pp.supplier_id = ?
+            WHERE pp.supplier_id = ? AND p.status = 'active'
             ORDER BY p.name ASC
         `, [supplierId]);
 
@@ -259,6 +268,9 @@ router.get('/proveedor/:supplierId', async (req, res) => {
 
 // ========================
 // GET /productos/:id/variantes
+// (Sin filtro de status del producto a propósito: si alguna pantalla
+// puntual necesita ver variantes de un producto desactivado —p.ej. al
+// reactivarlo— este endpoint sigue funcionando igual.)
 // ========================
 router.get('/:id/variantes', async (req, res) => {
     try {
@@ -303,6 +315,9 @@ router.get('/:id/variantes', async (req, res) => {
 
 // ========================
 // GET /productos/:id
+// (Sin filtro de status: siempre debe poder verse el detalle de un
+// producto puntual, activo o inactivo, por ejemplo para reactivarlo
+// o para revisar un producto viejo desde un reporte histórico.)
 // ========================
 router.get('/:id', async (req, res) => {
     try {
@@ -702,14 +717,50 @@ router.put('/:id', upload.any(), async (req, res) => {
 
 // ========================
 // DELETE /productos/:id
+// Ya NO borra físicamente. En su lugar marca el producto como
+// 'inactive' — esto preserva sus variantes, imágenes, y sobre todo su
+// historial de compras/ventas y los asientos contables ya generados.
+// Un DELETE físico arrastraría en cascada (ON DELETE CASCADE) las
+// variantes, y con ellas detalle_compras/ventas_detalle, dejando el
+// libro diario con referencias a productos que ya no existen.
 // ========================
 router.delete('/:id', async (req, res) => {
     try {
-        await db.query('DELETE FROM productos WHERE id = ?', [req.params.id]);
-        res.status(200).json({ success: true, message: 'Producto eliminado correctamente' });
+        const [result] = await db.query(
+            "UPDATE productos SET status = 'inactive' WHERE id = ?",
+            [req.params.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado' });
+        }
+
+        res.status(200).json({ success: true, message: 'Producto desactivado correctamente' });
     } catch (err) {
-        console.error('Error al eliminar el producto:', err);
-        res.status(500).send('Error al eliminar el producto');
+        console.error('Error al desactivar el producto:', err);
+        res.status(500).send('Error al desactivar el producto');
+    }
+});
+
+// ========================
+// PUT /productos/:id/reactivar
+// Vuelve a mostrar un producto que se había desactivado.
+// ========================
+router.put('/:id/reactivar', async (req, res) => {
+    try {
+        const [result] = await db.query(
+            "UPDATE productos SET status = 'active' WHERE id = ?",
+            [req.params.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ success: false, message: 'Producto no encontrado' });
+        }
+
+        res.status(200).json({ success: true, message: 'Producto reactivado correctamente' });
+    } catch (err) {
+        console.error('Error al reactivar el producto:', err);
+        res.status(500).send('Error al reactivar el producto');
     }
 });
 

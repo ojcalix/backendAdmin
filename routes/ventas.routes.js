@@ -220,7 +220,7 @@ router.post('/', async (req, res) => {
             reference_id: sale_id,
             user_id,
             lines
-        });
+        });desde
 
         await connection.commit();
         res.json({ message: "Venta registrada con éxito", sale_id });

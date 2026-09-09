@@ -54,14 +54,6 @@ function arrify(value) {
     return Array.isArray(value) ? value : [value];
 }
 
-// ✅ Traduce un error de MySQL a un mensaje claro para el usuario
-function mensajeErrorDuplicado(err) {
-    if (err.code === 'ER_DUP_ENTRY' && err.sqlMessage?.includes('uq_barcode_por_producto')) {
-        return 'Ese código de barras ya está usado en otra variante de este mismo producto. Si el código se repite a propósito (ej. mismo código para todos los tonos), no hay problema — pero no puede repetirse dos veces dentro del mismo producto con nombres de variante distintos y, sin querer, el mismo código en una fila duplicada.';
-    }
-    return null;
-}
-
 async function attachVariantsToProducts(products) {
     if (!products.length) return products;
 
@@ -501,13 +493,6 @@ router.post('/', upload.any(), async (req, res) => {
         await connection.rollback();
         console.error('❌ Error al registrar producto en la base de datos:', dbError);
         await cleanupUploads(uploadedPublicIds);
-
-        // ✅ Mensaje claro si el error fue por código de barras duplicado dentro del mismo producto
-        const mensajeDuplicado = mensajeErrorDuplicado(dbError);
-        if (mensajeDuplicado) {
-            return res.status(409).json({ message: mensajeDuplicado });
-        }
-
         res.status(500).json({ message: 'Error al registrar el producto' });
     } finally {
         connection.release();
@@ -667,12 +652,6 @@ router.put('/:id', upload.any(), async (req, res) => {
         await connection.rollback();
         console.error('❌ Error al actualizar producto en la base de datos:', dbError);
         await cleanupUploads(uploadedPublicIds);
-
-        const mensajeDuplicado = mensajeErrorDuplicado(dbError);
-        if (mensajeDuplicado) {
-            return res.status(409).json({ message: mensajeDuplicado });
-        }
-
         res.status(500).send("Error al actualizar el producto");
     } finally {
         connection.release();

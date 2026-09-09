@@ -28,6 +28,36 @@ function slugify(text) {
     return base || 'item';
 }
 
+// ========================
+// Normalización y similitud de texto, usadas para detectar
+// posibles productos duplicados (nombre parecido, no idéntico)
+// ========================
+function normalizeText(str) {
+    return (str || '')
+        .toString()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function tokenSet(str) {
+    return new Set(normalizeText(str).split(' ').filter(Boolean));
+}
+
+function jaccardSimilarity(a, b) {
+    const setA = tokenSet(a);
+    const setB = tokenSet(b);
+    if (!setA.size || !setB.size) return 0;
+
+    let intersection = 0;
+    setA.forEach(tok => { if (setB.has(tok)) intersection++; });
+
+    const union = new Set([...setA, ...setB]).size;
+    return intersection / union;
+}
+
 async function uploadToCloudinary(buffer, folder, publicId, size = 400, quality = 60) {
     const resized = await sharp(buffer).resize(size, size).webp({ quality }).toBuffer();
     return new Promise((resolve, reject) => {
@@ -234,6 +264,56 @@ router.get('/proveedor/:supplierId', async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).json({ message: 'Error al obtener los productos del proveedor.' });
+    }
+});
+
+// ========================
+// GET /productos/verificar-similar?name=&brand=&exclude_id=
+// Detecta productos existentes con nombre parecido, para prevenir
+// registros duplicados por error humano (doble clic, o repetir un
+// producto ya existente sin recordarlo). NO bloquea nada — solo informa,
+// dejando la decisión final al usuario.
+// ========================
+router.get('/verificar-similar', async (req, res) => {
+    try {
+        const { name, brand, exclude_id } = req.query;
+
+        if (!name || name.trim().length < 3) {
+            return res.json([]);
+        }
+
+        const [candidates] = await db.query(`
+            SELECT p.id AS productId, p.name AS productName, p.brand AS productBrand,
+                   c.name AS productCategory,
+                   (SELECT image FROM productos_imagenes WHERE product_id = p.id AND type = 'principal' LIMIT 1) AS productImage
+            FROM productos p
+            LEFT JOIN categorias c ON c.id = p.category_id
+            WHERE p.status = 'active'
+            ${exclude_id ? 'AND p.id != ?' : ''}
+        `, exclude_id ? [exclude_id] : []);
+
+        const matches = candidates
+            .map(c => {
+                const similarity = jaccardSimilarity(name, c.productName);
+                const sameBrand = brand && c.productBrand
+                    ? normalizeText(brand) === normalizeText(c.productBrand)
+                    : false;
+                const exactMatch = normalizeText(name) === normalizeText(c.productName);
+                return { ...c, similarity, sameBrand, exactMatch };
+            })
+            // Umbral: nombre idéntico siempre entra; nombre con bastante
+            // solapamiento de palabras entra; solapamiento moderado +
+            // misma marca también entra (ej. "212 VIP" vs "212 VIP Rosé"
+            // de la misma marca es sospechoso, aunque no sea idéntico)
+            .filter(c => c.exactMatch || c.similarity >= 0.5 || (c.similarity >= 0.34 && c.sameBrand))
+            .sort((a, b) => (b.exactMatch - a.exactMatch) || (b.similarity - a.similarity))
+            .slice(0, 5);
+
+        res.json(matches);
+
+    } catch (error) {
+        console.error('Error al verificar productos similares:', error);
+        res.status(500).json({ message: 'Error al verificar productos similares' });
     }
 });
 

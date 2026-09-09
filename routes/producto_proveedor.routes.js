@@ -73,19 +73,94 @@ router.post('/', async (req, res) => {
 });
 
 // ========================
+// PUT /producto_proveedor/:id
+// Actualiza el precio de compra de un registro ya existente. También
+// permite reasignar producto/proveedor/variante si hiciera falta, pero
+// el caso normal es solo "el proveedor me cambió el precio".
+//
+// El chequeo de duplicados es el mismo que en el POST, pero excluyendo
+// el propio registro (id != ?) — si no, editar un registro chocaría
+// siempre contra sí mismo y nunca se podría guardar el cambio.
+// ========================
+router.put('/:id', async (req, res) => {
+    const { id } = req.params;
+    const { product_id, supplier_id, purchase_price, variant_id } = req.body;
+
+    if (!product_id || !supplier_id || !purchase_price) {
+        return res.status(400).json({ message: 'Producto, proveedor y precio son obligatorios.' });
+    }
+
+    const variantIdValue = (variant_id !== undefined && variant_id !== null && variant_id !== '')
+        ? variant_id
+        : null;
+
+    try {
+        const [recordExists] = await db.query(
+            `SELECT id FROM producto_proveedor WHERE id = ?`,
+            [id]
+        );
+        if (!recordExists.length) {
+            return res.status(404).json({ message: 'Registro no encontrado.' });
+        }
+
+        if (variantIdValue !== null) {
+            const [variantCheck] = await db.query(
+                `SELECT id FROM variantes WHERE id = ? AND product_id = ?`,
+                [variantIdValue, product_id]
+            );
+            if (!variantCheck.length) {
+                return res.status(400).json({ message: 'La variante seleccionada no pertenece a este producto.' });
+            }
+        }
+
+        const [existing] = await db.query(
+            `SELECT id FROM producto_proveedor 
+             WHERE product_id = ? AND supplier_id = ? AND variant_id <=> ? AND id != ?
+             LIMIT 1`,
+            [product_id, supplier_id, variantIdValue, id]
+        );
+
+        if (existing.length > 0) {
+            return res.status(409).json({
+                message: variantIdValue
+                    ? 'Ya existe otro registro con esta variante y este proveedor.'
+                    : 'Ya existe otro registro con precio global para este producto y proveedor.'
+            });
+        }
+
+        await db.query(
+            `UPDATE producto_proveedor 
+             SET product_id = ?, supplier_id = ?, variant_id = ?, purchase_price = ? 
+             WHERE id = ?`,
+            [product_id, supplier_id, variantIdValue, purchase_price, id]
+        );
+
+        res.json({ message: 'Precio actualizado correctamente' });
+
+    } catch (err) {
+        console.error('Error al actualizar el producto con su proveedor:', err);
+        res.status(500).json({ message: 'Error interno del servidor' });
+    }
+});
+
+// ========================
 // GET /producto_proveedor
 // Lista todos los registros (producto completo o variante puntual) con
 // su proveedor y precio. "variante" viene null cuando el precio es global.
+// Devuelve también product_id/supplier_id/variant_id crudos, para poder
+// precargar el formulario de edición sin otra consulta.
 // ========================
 router.get('/', async (req, res) => {
     try {
         const query = `
             SELECT
                 pp.id,
+                pp.product_id,
+                pp.supplier_id,
+                pp.variant_id,
                 p.name AS producto,
                 pr.name AS proveedor,
                 pp.purchase_price,
-                pp.variant_id,
                 v.variant_name AS variante
             FROM producto_proveedor AS pp
             JOIN productos p ON pp.product_id = p.id

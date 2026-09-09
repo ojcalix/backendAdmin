@@ -16,23 +16,16 @@ function bufferToStream(buffer) {
     return stream;
 }
 
-// ========================
-// Slug seguro para Cloudinary: quita acentos/diacríticos y cualquier
-// carácter que no sea letra, número, guión o guión bajo. Antes solo se
-// reemplazaban espacios, así que un nombre con tilde o símbolo (ej.
-// "Édition", "50 ml!") producía un public_id inválido y Cloudinary
-// rechazaba el upload.
-// ========================
 function slugify(text) {
     const base = (text || 'item')
         .toString()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quita acentos: á->a, ñ->n, etc.
-        .replace(/[^a-zA-Z0-9\s_-]/g, '')                  // quita cualquier símbolo no permitido
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9\s_-]/g, '')
         .trim()
         .replace(/\s+/g, '_')
         .toLowerCase();
 
-    return base || 'item'; // por si el nombre queda vacío tras sanear (ej. era solo emojis)
+    return base || 'item';
 }
 
 async function uploadToCloudinary(buffer, folder, publicId, size = 400, quality = 60) {
@@ -46,11 +39,6 @@ async function uploadToCloudinary(buffer, folder, publicId, size = 400, quality 
     });
 }
 
-// ========================
-// Borra de Cloudinary las imágenes ya subidas cuando algo falla después
-// (best-effort: si la limpieza misma falla, solo se registra en consola,
-// nunca se lanza el error hacia el cliente).
-// ========================
 async function cleanupUploads(publicIds) {
     for (const publicId of publicIds) {
         try {
@@ -66,14 +54,14 @@ function arrify(value) {
     return Array.isArray(value) ? value : [value];
 }
 
-// ========================
-// Helper: dado un array de productos base (con productId), agrega
-// sus variantes activas. Cada variante trae su propia imagen si existe,
-// o hereda la imagen "principal" del producto como respaldo (fallback).
-// También calcula minPrice/maxPrice/variantCount/productQuantity
-// a partir de esas variantes, y expone productImage (imagen principal
-// del producto, puede ser null si el producto no tiene imagen propia).
-// ========================
+// ✅ Traduce un error de MySQL a un mensaje claro para el usuario
+function mensajeErrorDuplicado(err) {
+    if (err.code === 'ER_DUP_ENTRY' && err.sqlMessage?.includes('uq_barcode_por_producto')) {
+        return 'Ese código de barras ya está usado en otra variante de este mismo producto. Si el código se repite a propósito (ej. mismo código para todos los tonos), no hay problema — pero no puede repetirse dos veces dentro del mismo producto con nombres de variante distintos y, sin querer, el mismo código en una fila duplicada.';
+    }
+    return null;
+}
+
 async function attachVariantsToProducts(products) {
     if (!products.length) return products;
 
@@ -128,7 +116,6 @@ async function attachVariantsToProducts(products) {
 
 // ========================
 // GET /productos?page=&limit=
-// Solo productos activos.
 // ========================
 router.get('/', async (req, res) => {
     try {
@@ -136,9 +123,7 @@ router.get('/', async (req, res) => {
         const limit = Math.max(parseInt(req.query.limit) || 5, 1);
         const offset = (page - 1) * limit;
 
-        const [totalResult] = await db.query(
-            "SELECT COUNT(*) AS total FROM productos WHERE status = 'active'"
-        );
+        const [totalResult] = await db.query('SELECT COUNT(*) AS total FROM productos');
         const total = totalResult[0].total;
         const totalPages = Math.ceil(total / limit);
 
@@ -152,7 +137,6 @@ router.get('/', async (req, res) => {
                 p.registration_date AS createdAt
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
-            WHERE p.status = 'active'
             ORDER BY p.registration_date DESC
             LIMIT ? OFFSET ?
         `, [limit, offset]);
@@ -169,7 +153,6 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /productos/todos
-// Solo productos activos.
 // ========================
 router.get('/todos', async (req, res) => {
     try {
@@ -189,7 +172,6 @@ router.get('/todos', async (req, res) => {
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
             LEFT JOIN variantes v ON v.product_id = p.id AND v.status = 'active'
-            WHERE p.status = 'active'
             GROUP BY p.id
             ORDER BY p.name ASC
         `);
@@ -202,7 +184,6 @@ router.get('/todos', async (req, res) => {
 
 // ========================
 // GET /productos/buscar/:termino
-// Solo productos activos.
 // ========================
 router.get('/buscar/:termino', async (req, res) => {
     const { termino } = req.params;
@@ -218,10 +199,9 @@ router.get('/buscar/:termino', async (req, res) => {
                 p.registration_date AS createdAt
             FROM productos p
             LEFT JOIN categorias c ON c.id = p.category_id
-            WHERE p.status = 'active'
-              AND (p.name LIKE ? OR p.id = ? OR EXISTS (
+            WHERE p.name LIKE ? OR p.id = ? OR EXISTS (
                 SELECT 1 FROM variantes v3 WHERE v3.product_id = p.id AND v3.barcode = ?
-              ))
+            )
             ORDER BY p.name ASC
         `, [`%${termino}%`, termino, termino]);
 
@@ -236,7 +216,6 @@ router.get('/buscar/:termino', async (req, res) => {
 
 // ========================
 // GET /productos/proveedor/:supplierId
-// Solo productos activos.
 // ========================
 router.get('/proveedor/:supplierId', async (req, res) => {
     try {
@@ -254,7 +233,7 @@ router.get('/proveedor/:supplierId', async (req, res) => {
             FROM producto_proveedor pp
             INNER JOIN productos p ON p.id = pp.product_id
             LEFT JOIN categorias c ON c.id = p.category_id
-            WHERE pp.supplier_id = ? AND p.status = 'active'
+            WHERE pp.supplier_id = ?
             ORDER BY p.name ASC
         `, [supplierId]);
 
@@ -268,9 +247,6 @@ router.get('/proveedor/:supplierId', async (req, res) => {
 
 // ========================
 // GET /productos/:id/variantes
-// (Sin filtro de status del producto a propósito: si alguna pantalla
-// puntual necesita ver variantes de un producto desactivado —p.ej. al
-// reactivarlo— este endpoint sigue funcionando igual.)
 // ========================
 router.get('/:id/variantes', async (req, res) => {
     try {
@@ -315,9 +291,6 @@ router.get('/:id/variantes', async (req, res) => {
 
 // ========================
 // GET /productos/:id
-// (Sin filtro de status: siempre debe poder verse el detalle de un
-// producto puntual, activo o inactivo, por ejemplo para reactivarlo
-// o para revisar un producto viejo desde un reporte histórico.)
 // ========================
 router.get('/:id', async (req, res) => {
     try {
@@ -377,25 +350,11 @@ router.get('/:id', async (req, res) => {
 
 // ========================
 // POST /productos
-// FLUJO CORREGIDO (evita quemar IDs de MySQL con fallos de Cloudinary):
-//
-//   1. Validar datos (nombre, categoría, al menos 1 variante) → si falla,
-//      responde de una vez, sin tocar MySQL ni Cloudinary.
-//   2. Subir TODAS las imágenes a Cloudinary primero, con un slug seguro.
-//      Si cualquier subida falla, se limpian las que sí se subieron y se
-//      responde el error — MySQL nunca se toca, ningún AUTO_INCREMENT
-//      se pierde.
-//   3. Solo si el paso 2 fue 100% exitoso, se abre la transacción y se
-//      insertan producto, imágenes (ya con su URL) y variantes.
-//   4. Si algo falla en este paso (raro), se hace ROLLBACK en MySQL y se
-//      intenta borrar las imágenes ya subidas a Cloudinary, para no
-//      dejar archivos huérfanos.
 // ========================
 router.post('/', upload.any(), async (req, res) => {
     const { productName, productBrand, category_id, gender_id, productDescription } = req.body;
     const variants = req.body.variants ? JSON.parse(req.body.variants) : [];
 
-    // --- Paso 1: validar antes de tocar cualquier servicio externo ---
     if (!productName || !category_id) {
         return res.status(400).json({ message: "Nombre y categoría son obligatorios." });
     }
@@ -411,14 +370,13 @@ router.post('/', upload.any(), async (req, res) => {
     }
 
     const productSlug = slugify(productName);
-    const uploadedPublicIds = []; // para limpieza si algo falla después
+    const uploadedPublicIds = [];
 
     let productMainUpload = null;
     let productHoverUpload = null;
     const productExtraUploads = [];
-    const variantUploads = {}; // { [index]: { main, hover, extras: [] } }
+    const variantUploads = {};
 
-    // --- Paso 2: subir TODAS las imágenes antes de tocar MySQL ---
     try {
         const mainFile = req.files.find(f => f.fieldname === 'mainImage');
         if (mainFile) {
@@ -471,7 +429,6 @@ router.post('/', upload.any(), async (req, res) => {
         return res.status(500).json({ message: `Error al subir imágenes: ${uploadError.message}` });
     }
 
-    // --- Paso 3: todas las imágenes están arriba; ahora sí, MySQL ---
     const connection = await db.getConnection();
 
     try {
@@ -543,8 +500,14 @@ router.post('/', upload.any(), async (req, res) => {
     } catch (dbError) {
         await connection.rollback();
         console.error('❌ Error al registrar producto en la base de datos:', dbError);
-        // Las imágenes ya están en Cloudinary pero el producto no se guardó: limpiamos para no dejar huérfanos.
         await cleanupUploads(uploadedPublicIds);
+
+        // ✅ Mensaje claro si el error fue por código de barras duplicado dentro del mismo producto
+        const mensajeDuplicado = mensajeErrorDuplicado(dbError);
+        if (mensajeDuplicado) {
+            return res.status(409).json({ message: mensajeDuplicado });
+        }
+
         res.status(500).json({ message: 'Error al registrar el producto' });
     } finally {
         connection.release();
@@ -553,9 +516,6 @@ router.post('/', upload.any(), async (req, res) => {
 
 // ========================
 // PUT /productos/:id
-// Mismo principio: subir imágenes nuevas primero, y solo si todo sale
-// bien, aplicar los cambios en MySQL. Así una variante nueva agregada
-// durante una edición tampoco quema su ID si Cloudinary falla.
 // ========================
 router.put('/:id', upload.any(), async (req, res) => {
     const productId = req.params.id;
@@ -578,7 +538,6 @@ router.put('/:id', upload.any(), async (req, res) => {
     const productExtraUploads = [];
     const variantUploads = {};
 
-    // --- Subir imágenes nuevas primero ---
     try {
         const mainFile = req.files.find(f => f.fieldname === 'mainImage');
         if (mainFile) {
@@ -631,7 +590,6 @@ router.put('/:id', upload.any(), async (req, res) => {
         return res.status(500).json({ message: `Error al subir imágenes: ${uploadError.message}` });
     }
 
-    // --- Ahora sí, aplicar cambios en MySQL ---
     const connection = await db.getConnection();
 
     try {
@@ -709,6 +667,12 @@ router.put('/:id', upload.any(), async (req, res) => {
         await connection.rollback();
         console.error('❌ Error al actualizar producto en la base de datos:', dbError);
         await cleanupUploads(uploadedPublicIds);
+
+        const mensajeDuplicado = mensajeErrorDuplicado(dbError);
+        if (mensajeDuplicado) {
+            return res.status(409).json({ message: mensajeDuplicado });
+        }
+
         res.status(500).send("Error al actualizar el producto");
     } finally {
         connection.release();
@@ -717,50 +681,14 @@ router.put('/:id', upload.any(), async (req, res) => {
 
 // ========================
 // DELETE /productos/:id
-// Ya NO borra físicamente. En su lugar marca el producto como
-// 'inactive' — esto preserva sus variantes, imágenes, y sobre todo su
-// historial de compras/ventas y los asientos contables ya generados.
-// Un DELETE físico arrastraría en cascada (ON DELETE CASCADE) las
-// variantes, y con ellas detalle_compras/ventas_detalle, dejando el
-// libro diario con referencias a productos que ya no existen.
 // ========================
 router.delete('/:id', async (req, res) => {
     try {
-        const [result] = await db.query(
-            "UPDATE productos SET status = 'inactive' WHERE id = ?",
-            [req.params.id]
-        );
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ success: false, message: 'Producto no encontrado' });
-        }
-
-        res.status(200).json({ success: true, message: 'Producto desactivado correctamente' });
+        await db.query('DELETE FROM productos WHERE id = ?', [req.params.id]);
+        res.status(200).json({ success: true, message: 'Producto eliminado correctamente' });
     } catch (err) {
-        console.error('Error al desactivar el producto:', err);
-        res.status(500).send('Error al desactivar el producto');
-    }
-});
-
-// ========================
-// PUT /productos/:id/reactivar
-// Vuelve a mostrar un producto que se había desactivado.
-// ========================
-router.put('/:id/reactivar', async (req, res) => {
-    try {
-        const [result] = await db.query(
-            "UPDATE productos SET status = 'active' WHERE id = ?",
-            [req.params.id]
-        );
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ success: false, message: 'Producto no encontrado' });
-        }
-
-        res.status(200).json({ success: true, message: 'Producto reactivado correctamente' });
-    } catch (err) {
-        console.error('Error al reactivar el producto:', err);
-        res.status(500).send('Error al reactivar el producto');
+        console.error('Error al eliminar el producto:', err);
+        res.status(500).send('Error al eliminar el producto');
     }
 });
 

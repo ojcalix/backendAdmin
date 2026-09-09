@@ -23,11 +23,6 @@ router.get('/fuentes-financiamiento', async (req, res) => {
 
 // ========================
 // POST /compras/apertura
-// Carga inventario que YA existía antes de usar el sistema.
-// No requiere caja, no genera cuenta por pagar, no toca proveedor.
-// Se identifica como "apertura" porque supplier_id queda NULL —
-// una compra normal siempre requiere un proveedor.
-// Asiento: Debe Inventario (1104) / Haber Capital Social (3101).
 // ========================
 router.post('/apertura', async (req, res) => {
     const { user_id, products, notes } = req.body;
@@ -58,8 +53,8 @@ router.post('/apertura', async (req, res) => {
 
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_method, payment_status, purchase_price, paid_amount, pending_amount) 
-             VALUES (NULL, ?, 'cash', 'cash', 'paid', ?, ?, 0)`,
+                (supplier_id, user_id, payment_type, payment_method, payment_status, purchase_price, shipping_cost, paid_amount, pending_amount) 
+             VALUES (NULL, ?, 'cash', 'cash', 'paid', ?, 0, ?, 0)`,
             [user_id, total, total]
         );
         const purchase_id = compraResult.insertId;
@@ -120,6 +115,11 @@ router.post('/apertura', async (req, res) => {
 
 // ========================
 // POST /compras
+// Ahora recibe products_amount (subtotal de productos) y shipping_cost
+// por separado. El total de la compra (purchase_price almacenado) es
+// la suma de ambos. El envío NO se capitaliza al inventario — se
+// contabiliza como gasto (6102), para no afectar el costo promedio
+// por unidad de cada variante.
 // ========================
 router.post('/', async (req, res) => {
     const {
@@ -130,7 +130,8 @@ router.post('/', async (req, res) => {
         payment_method,
         bank_id,
         financing_source_id,
-        purchase_price,
+        products_amount,
+        shipping_cost,
         paid_amount,
         pending_amount,
         products
@@ -146,6 +147,13 @@ router.post('/', async (req, res) => {
     }
 
     const normalizedPaymentMethod = payment_method || 'cash';
+    const normalizedProductsAmount = parseFloat(products_amount) || 0;
+    const normalizedShippingCost = parseFloat(shipping_cost) || 0;
+    const totalPurchase = normalizedProductsAmount + normalizedShippingCost;
+
+    if (normalizedProductsAmount <= 0) {
+        return res.status(400).json({ error: "El subtotal de productos debe ser mayor a cero." });
+    }
 
     const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
 
@@ -251,9 +259,9 @@ router.post('/', async (req, res) => {
 
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, paid_amount, pending_amount) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, purchase_price, paid_amount, pending_amount]
+                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, shipping_cost, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, totalPurchase, normalizedShippingCost, paid_amount, pending_amount]
         );
         const purchase_id = compraResult.insertId;
 
@@ -339,6 +347,9 @@ router.post('/', async (req, res) => {
             );
         }
 
+        // ✅ Asiento contable: el costo de productos capitaliza a Inventario (1104);
+        // el envío, si lo hay, va a Gastos de Compras (6102) — no se mezcla con
+        // el costo promedio de las variantes.
         let cuentaDineroCode;
         if (normalizedPaymentMethod === 'cash') {
             cuentaDineroCode = '1101';
@@ -352,7 +363,11 @@ router.post('/', async (req, res) => {
             cuentaDineroCode = accountRow[0].code;
         }
 
-        const lines = [{ code: '1104', debit: purchase_price }];
+        const lines = [{ code: '1104', debit: normalizedProductsAmount }];
+
+        if (normalizedShippingCost > 0) {
+            lines.push({ code: '6102', debit: normalizedShippingCost, description: 'Costo de envío' });
+        }
 
         if (paid_amount > 0) {
             lines.push({ code: cuentaDineroCode, credit: paid_amount });
@@ -383,7 +398,6 @@ router.post('/', async (req, res) => {
 
 // ========================
 // GET /compras
-// LEFT JOIN a proveedores + marca is_opening_balance cuando supplier_id es NULL
 // ========================
 router.get('/', async (req, res) => {
     try {
@@ -393,6 +407,7 @@ router.get('/', async (req, res) => {
                 COALESCE(p.name, 'Apertura de Inventario') AS proveedor,
                 u.username AS usuario,
                 c.purchase_price,
+                c.shipping_cost,
                 c.payment_status,
                 c.purchase_date,
                 (c.supplier_id IS NULL) AS is_opening_balance
@@ -419,7 +434,7 @@ router.get('/:id(\\d+)', async (req, res) => {
 
         const [compra] = await db.query(`
             SELECT 
-                c.id, c.purchase_price, c.purchase_date, c.payment_type, c.payment_status,
+                c.id, c.purchase_price, c.shipping_cost, c.purchase_date, c.payment_type, c.payment_status,
                 c.payment_method, c.paid_amount, c.pending_amount,
                 u.username, COALESCE(pr.name, 'Apertura de Inventario') AS proveedor,
                 ff.name AS financing_source_name,
@@ -447,7 +462,16 @@ router.get('/:id(\\d+)', async (req, res) => {
             WHERE dc.purchase_id = ?
         `, [id]);
 
-        res.json({ compra: compra[0], productos: detalle });
+        // Gastos posteriores vinculados a esta compra (ej. envío pagado después)
+        const [gastosVinculados] = await db.query(`
+            SELECT g.id, g.concept, g.amount, g.date, cg.name AS category_name
+            FROM gastos g
+            INNER JOIN categorias_gastos cg ON g.category_id = cg.id
+            WHERE g.purchase_id = ?
+            ORDER BY g.date ASC
+        `, [id]);
+
+        res.json({ compra: compra[0], productos: detalle, gastos_vinculados: gastosVinculados });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Error al obtener la compra' });

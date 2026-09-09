@@ -19,7 +19,38 @@ router.get('/categorias', async (req, res) => {
 });
 
 // ========================
+// GET /gastos/compras-disponibles/:term
+// Busca compras (por ID o nombre de proveedor) para vincular un gasto,
+// ej. un envío que se paga después de recibir el producto.
+// ========================
+router.get('/compras-disponibles/:term', async (req, res) => {
+    try {
+        const { term } = req.params;
+
+        const [results] = await db.query(`
+            SELECT 
+                c.id,
+                COALESCE(p.name, 'Apertura de Inventario') AS proveedor,
+                c.purchase_price,
+                c.purchase_date
+            FROM compras c
+            LEFT JOIN proveedores p ON c.supplier_id = p.id
+            WHERE c.id = ? OR p.name LIKE ?
+            ORDER BY c.purchase_date DESC
+            LIMIT 20
+        `, [isNaN(term) ? 0 : term, `%${term}%`]);
+
+        res.json(results);
+
+    } catch (error) {
+        console.error("❌ Error al buscar compras:", error);
+        res.status(500).json({ error: "Error al buscar compras" });
+    }
+});
+
+// ========================
 // GET /gastos
+// Incluye purchase_id y, si aplica, el proveedor de la compra vinculada.
 // ========================
 router.get('/', async (req, res) => {
     const { category_id, date_from, date_to } = req.query;
@@ -32,11 +63,15 @@ router.get('/', async (req, res) => {
                 g.amount,
                 g.payment_method,
                 g.date,
+                g.purchase_id,
                 cg.name AS category_name,
-                u.username
+                u.username,
+                p.name AS linked_purchase_supplier
             FROM gastos g
             INNER JOIN categorias_gastos cg ON g.category_id = cg.id
             INNER JOIN usuarios u ON g.user_id = u.id
+            LEFT JOIN compras c ON g.purchase_id = c.id
+            LEFT JOIN proveedores p ON c.supplier_id = p.id
             WHERE 1 = 1
         `;
 
@@ -70,9 +105,14 @@ router.get('/', async (req, res) => {
 
 // ========================
 // POST /gastos
+// purchase_id es opcional: cuando se envía, el gasto queda vinculado a
+// esa compra (ej. envío pagado después de recibir el producto) y su
+// asiento contable va a Gastos de Compras (6102) en vez del genérico
+// Gastos Generales (6101), para mantener separado el costo logístico
+// de compras del resto de gastos operativos.
 // ========================
 router.post('/', async (req, res) => {
-    const { category_id, concept, amount, payment_method, bank_id, user_id } = req.body;
+    const { category_id, concept, amount, payment_method, bank_id, user_id, purchase_id } = req.body;
 
     if (!category_id || !concept || !amount || amount <= 0 || !user_id) {
         return res.status(400).json({ error: "Datos incompletos o monto inválido." });
@@ -94,6 +134,18 @@ router.post('/', async (req, res) => {
 
         let cajaAbierta = null;
         let bankAccount = null;
+
+        if (purchase_id) {
+            const [purchaseExists] = await connection.query(
+                "SELECT id FROM compras WHERE id = ?",
+                [purchase_id]
+            );
+
+            if (!purchaseExists.length) {
+                await connection.rollback();
+                return res.status(404).json({ error: "La compra que intenta vincular no existe." });
+            }
+        }
 
         if (payment_method === 'cash') {
             const [cajaResult] = await connection.query(
@@ -150,9 +202,9 @@ router.post('/', async (req, res) => {
         }
 
         const [gastoResult] = await connection.query(
-            `INSERT INTO gastos (category_id, concept, amount, payment_method, caja_id, bank_id, user_id) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [category_id, concept, amount, payment_method, cajaAbierta ? cajaAbierta.id : null, bankAccount ? bank_id : null, user_id]
+            `INSERT INTO gastos (category_id, concept, amount, payment_method, caja_id, bank_id, user_id, purchase_id) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [category_id, concept, amount, payment_method, cajaAbierta ? cajaAbierta.id : null, bankAccount ? bank_id : null, user_id, purchase_id || null]
         );
 
         if (cajaAbierta) {
@@ -177,14 +229,15 @@ router.post('/', async (req, res) => {
         }
 
         const cuentaOrigen = payment_method === 'cash' ? '1101' : '1102';
+        const cuentaGasto = purchase_id ? '6102' : '6101';
 
         await crearAsiento(connection, {
-            description: `Gasto: ${concept}`,
+            description: purchase_id ? `Gasto: ${concept} (vinculado a Compra #${purchase_id})` : `Gasto: ${concept}`,
             reference_type: 'gasto',
             reference_id: gastoResult.insertId,
             user_id,
             lines: [
-                { code: '6101', debit: amount },
+                { code: cuentaGasto, debit: amount },
                 { code: cuentaOrigen, credit: amount }
             ]
         });

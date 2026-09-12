@@ -56,4 +56,38 @@ async function crearAsiento(connection, { description, reference_type, reference
     return entry_id;
 }
 
-module.exports = { crearAsiento, getCuentaId };
+// ========================
+// Genera el asiento contrario a uno ya existente (para reversiones).
+// Busca las líneas del asiento original y las invierte: lo que era
+// débito pasa a crédito y viceversa. Así el reverso siempre cuadra
+// exactamente igual que el original, sin tener que reconstruirlo a mano.
+// ========================
+async function reversarAsiento(connection, { reference_type, original_reference_id, new_reference_id, description, user_id }) {
+    const [originalEntry] = await connection.query(
+        `SELECT id FROM asientos_contables WHERE reference_type = ? AND reference_id = ? ORDER BY id ASC LIMIT 1`,
+        [reference_type, original_reference_id]
+    );
+
+    if (!originalEntry.length) return null; // no había asiento original que reversar
+
+    const [originalLines] = await connection.query(
+        `SELECT account_id, debit, credit FROM asientos_detalle WHERE entry_id = ?`,
+        [originalEntry[0].id]
+    );
+
+    const [entryResult] = await connection.query(
+        `INSERT INTO asientos_contables (description, reference_type, reference_id, user_id) VALUES (?, 'ajuste', ?, ?)`,
+        [description, new_reference_id, user_id]
+    );
+
+    for (const line of originalLines) {
+        await connection.query(
+            `INSERT INTO asientos_detalle (entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)`,
+            [entryResult.insertId, line.account_id, line.credit, line.debit] // invertido
+        );
+    }
+
+    return entryResult.insertId;
+}
+
+module.exports = { crearAsiento, getCuentaId, reversarAsiento };

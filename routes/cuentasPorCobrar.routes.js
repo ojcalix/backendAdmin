@@ -22,13 +22,10 @@ router.get('/', async (req, res) => {
                 v.total,
                 v.paid_amount,
                 v.pending_amount,
-                v.payment_status,
-                NOT EXISTS (
-                    SELECT 1 FROM ventas_detalle vd WHERE vd.sale_id = v.id
-                ) AS is_opening_balance
+                v.payment_status
             FROM ventas v
             INNER JOIN clientes c ON v.customer_id = c.id
-            WHERE v.payment_status IN ('pending', 'partial')
+            WHERE v.payment_status IN ('pending', 'partial') AND v.status = 'completada'
         `;
 
         const params = [];

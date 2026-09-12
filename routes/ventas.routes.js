@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
-const { crearAsiento } = require('../helpers/contabilidad');
+const { crearAsiento, reversarAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // POST /ventas
@@ -17,10 +17,11 @@ router.post('/', async (req, res) => {
         total,
         paid_amount,
         pending_amount,
+        earned_points,
         products
     } = req.body;
 
-    if (!user_id || !products || !products.length) {
+    if (!user_id || !products.length) {
         return res.status(400).json({ error: "Datos incompletos." });
     }
 
@@ -33,19 +34,14 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
     }
 
-    // Normalizado desde el inicio: así la verificación de caja/banco y el
-    // INSERT final siempre usan exactamente el mismo valor, sin posibilidad
-    // de que diverjan (mismo criterio que compras.js).
-    const normalizedPaymentMethod = payment_method || 'cash';
-
     const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
 
     if (entraDinero) {
         const validMethods = ['cash', 'transfer', 'card'];
-        if (!validMethods.includes(normalizedPaymentMethod)) {
+        if (!validMethods.includes(payment_method)) {
             return res.status(400).json({ error: "Método de pago inválido." });
         }
-        if ((normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') && !bank_id) {
+        if ((payment_method === 'transfer' || payment_method === 'card') && !bank_id) {
             return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
         }
     }
@@ -58,29 +54,23 @@ router.post('/', async (req, res) => {
         let cajaAbierta = null;
         let bankAccount = null;
 
-        // ✅ Caja abierta: OBLIGATORIA para cualquier venta, sin importar el
-        // método de pago. Representa la sesión de trabajo del usuario, no
-        // solo el efectivo. Se bloquea la fila (FOR UPDATE) para que si otra
-        // petición la cierra al mismo tiempo, esta venta no se cuele leyendo
-        // un estado "abierta" que ya no es válido.
-        const [cajaResult] = await connection.query(
-            "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
-            [user_id]
-        );
+        if (entraDinero && payment_method === 'cash') {
+            const [cajaResult] = await connection.query(
+                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
+                [user_id]
+            );
 
-        if (!cajaResult.length) {
-            await connection.rollback();
-            return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas." });
+            if (!cajaResult.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas en efectivo." });
+            }
+
+            cajaAbierta = cajaResult[0];
         }
 
-        cajaAbierta = cajaResult[0];
-
-        // ✅ Transferencia/tarjeta: además de la caja abierta, se bloquea la
-        // fila del banco (FOR UPDATE) por el mismo motivo — evita
-        // condiciones de carrera con otras operaciones sobre esa cuenta.
-        if (entraDinero && (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card')) {
+        if (entraDinero && (payment_method === 'transfer' || payment_method === 'card')) {
             const [bankResult] = await connection.query(
-                "SELECT id FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
+                "SELECT id FROM bancos WHERE id = ? AND status = 'active'",
                 [bank_id]
             );
 
@@ -92,17 +82,15 @@ router.post('/', async (req, res) => {
             bankAccount = bankResult[0];
         }
 
-        // ✅ Insertar venta (earned_points se actualiza después, según lo que gane cada línea)
         const [ventaResult] = await connection.query(
             `INSERT INTO ventas 
                 (user_id, customer_id, payment_type, payment_status, payment_method, bank_id, total, paid_amount, pending_amount, earned_points) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-            [user_id, customer_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, total, paid_amount, pending_amount]
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [user_id, customer_id, payment_type, payment_status, payment_method || 'cash', bank_id || null, total, paid_amount, pending_amount, earned_points]
         );
         const sale_id = ventaResult.insertId;
 
-        // ✅ Registrar movimiento de caja solo si el dinero entró en efectivo
-        if (entraDinero && normalizedPaymentMethod === 'cash') {
+        if (cajaAbierta) {
             const concept = payment_type === 'cash'
                 ? `Venta #${sale_id} (contado)`
                 : `Venta #${sale_id} (abono inicial - mixto)`;
@@ -114,7 +102,6 @@ router.post('/', async (req, res) => {
             );
         }
 
-        // ✅ Registrar movimiento bancario si el pago fue transferencia/tarjeta
         if (bankAccount) {
             const concept = payment_type === 'cash'
                 ? `Venta #${sale_id} (contado)`
@@ -132,20 +119,15 @@ router.post('/', async (req, res) => {
             );
         }
 
-                let totalEarnedPoints = 0;
-        let totalCostOfGoods = 0;
+        let totalEarnedPoints = 0;
+        let totalCost = 0;
 
         for (const product of products) {
             const { product_id, variant_id, quantity, subtotal } = product;
 
-            if (!variant_id) {
-                await connection.rollback();
-                return res.status(400).json({ error: `Falta la variante para el producto (ID: ${product_id})` });
-            }
-
             const [variantStockResult] = await connection.query(
-                "SELECT quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
-                [variant_id, product_id]
+                "SELECT quantity FROM variantes WHERE id = ? FOR UPDATE",
+                [variant_id]
             );
 
             if (!variantStockResult.length || quantity > variantStockResult[0].quantity) {
@@ -153,22 +135,20 @@ router.post('/', async (req, res) => {
                 return res.status(400).json({ error: `Stock insuficiente o variante no encontrada (ID: ${variant_id})` });
             }
 
-            // ✅ Costo de lo vendido, usando el promedio ponderado de la
-            // variante. Esto es lo que hace falta para poder generar el
-            // asiento de Costo de Ventas / Inventario más abajo.
-            totalCostOfGoods += parseFloat(variantStockResult[0].average_cost) * parseInt(quantity);
-
             await connection.query(
                 "UPDATE variantes SET quantity = quantity - ? WHERE id = ?",
                 [quantity, variant_id]
             );
 
-            // 🔒 Los puntos solo se calculan y acumulan en ventas de CONTADO
-            let puntos = 0;
-            if (payment_type === 'cash') {
-                puntos = Math.floor(subtotal / 30);
-                totalEarnedPoints += puntos;
-            }
+            const [costRows] = await connection.query(
+                `SELECT purchase_price FROM detalle_compras WHERE variant_id = ? ORDER BY id DESC LIMIT 1`,
+                [variant_id]
+            );
+            const costoUnitario = costRows.length ? parseFloat(costRows[0].purchase_price) : 0;
+            totalCost += costoUnitario * quantity;
+
+            const puntos = Math.floor(subtotal / 30);
+            totalEarnedPoints += puntos;
 
             await connection.query(
                 "INSERT INTO ventas_detalle (sale_id, product_id, variant_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?, ?)",
@@ -181,8 +161,7 @@ router.post('/', async (req, res) => {
             [totalEarnedPoints, sale_id]
         );
 
-        // 🔒 El historial de puntos y la acumulación del cliente solo aplican en ventas de contado
-        if (payment_type === 'cash' && totalEarnedPoints > 0 && customer_id !== null) {
+        if (totalEarnedPoints > 0 && customer_id !== null) {
             await connection.query(
                 "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'earned')",
                 [customer_id, sale_id, totalEarnedPoints]
@@ -194,9 +173,7 @@ router.post('/', async (req, res) => {
             );
         }
 
-        // ✅ Generar asiento contable
-        const cuentaDinero = normalizedPaymentMethod === 'cash' ? '1101' : '1102';
-
+        const cuentaDinero = payment_method === 'cash' ? '1101' : '1102';
         const lines = [{ code: '4101', credit: total }];
 
         if (paid_amount > 0) {
@@ -205,13 +182,9 @@ router.post('/', async (req, res) => {
         if (pending_amount > 0) {
             lines.push({ code: '1103', debit: pending_amount });
         }
-
-        // ✅ Costo de Ventas / Inventario — sin esto, el inventario nunca
-        // baja contablemente y la utilidad queda inflada por el valor
-        // total de la venta, sin descontar el costo de la mercancía.
-        if (totalCostOfGoods > 0) {
-            lines.push({ code: '5101', debit: totalCostOfGoods });
-            lines.push({ code: '1104', credit: totalCostOfGoods });
+        if (totalCost > 0) {
+            lines.push({ code: '5101', debit: totalCost });
+            lines.push({ code: '1104', credit: totalCost });
         }
 
         await crearAsiento(connection, {
@@ -220,7 +193,7 @@ router.post('/', async (req, res) => {
             reference_id: sale_id,
             user_id,
             lines
-        });desde
+        });
 
         await connection.commit();
         res.json({ message: "Venta registrada con éxito", sale_id });
@@ -229,6 +202,142 @@ router.post('/', async (req, res) => {
         await connection.rollback();
         console.error("❌ Error en el registro de venta:", error);
         res.status(500).json({ error: "Error al registrar la venta" });
+    } finally {
+        connection.release();
+    }
+});
+
+// ========================
+// POST /ventas/:id/cancelar
+// Revierte stock, caja/banco, y genera el asiento contrario.
+// La venta NUNCA se borra — queda marcada como 'cancelada' para
+// mantener el historial completo.
+// ========================
+router.post('/:id/cancelar', async (req, res) => {
+    const { id } = req.params;
+    const { user_id, reason } = req.body;
+
+    if (!user_id) {
+        return res.status(400).json({ error: "Falta el usuario que cancela la venta." });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        const [ventaResult] = await connection.query(
+            "SELECT * FROM ventas WHERE id = ? FOR UPDATE",
+            [id]
+        );
+
+        if (!ventaResult.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: "Venta no encontrada." });
+        }
+
+        const venta = ventaResult[0];
+
+        if (venta.status === 'cancelada') {
+            await connection.rollback();
+            return res.status(400).json({ error: "Esta venta ya está cancelada." });
+        }
+
+        // ✅ Bloquear si ya hay abonos posteriores registrados
+        const [abonos] = await connection.query(
+            "SELECT COUNT(*) AS total FROM pagos_credito WHERE sale_id = ?",
+            [id]
+        );
+
+        if (abonos[0].total > 0) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: "Esta venta ya tiene abonos registrados. Debes cancelar esos abonos primero."
+            });
+        }
+
+        // ✅ Regresar el stock de cada variante vendida
+        const [detalle] = await connection.query(
+            "SELECT variant_id, quantity FROM ventas_detalle WHERE sale_id = ?",
+            [id]
+        );
+
+        for (const item of detalle) {
+            await connection.query(
+                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
+                [item.quantity, item.variant_id]
+            );
+        }
+
+        // ✅ Revertir efectivo (contra la caja ABIERTA HOY del usuario que cancela)
+        if (venta.paid_amount > 0 && venta.payment_method === 'cash') {
+            const [cajaResult] = await connection.query(
+                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
+                [user_id]
+            );
+
+            if (!cajaResult.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: "Debes abrir tu caja para poder cancelar una venta en efectivo (el reverso se registra en tu caja actual)." });
+            }
+
+            await connection.query(
+                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                 VALUES (?, 'expense', ?, ?, 'venta', ?)`,
+                [cajaResult[0].id, `Cancelación de venta #${id}`, venta.paid_amount, id]
+            );
+        }
+
+        // ✅ Revertir banco
+        if (venta.paid_amount > 0 && (venta.payment_method === 'transfer' || venta.payment_method === 'card')) {
+            await connection.query(
+                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'transfer_out', ?, ?, 'venta', ?)`,
+                [venta.bank_id, venta.paid_amount, `Cancelación de venta #${id}`, id]
+            );
+
+            await connection.query(
+                "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
+                [venta.paid_amount, venta.bank_id]
+            );
+        }
+
+        // ✅ Revertir puntos ganados, si el cliente los sigue teniendo
+        if (venta.earned_points > 0 && venta.customer_id) {
+            await connection.query(
+                "UPDATE clientes SET accumulated_points = GREATEST(accumulated_points - ?, 0) WHERE id = ?",
+                [venta.earned_points, venta.customer_id]
+            );
+
+            await connection.query(
+                "INSERT INTO historial_puntos (customer_id, sale_id, points, type) VALUES (?, ?, ?, 'used')",
+                [venta.customer_id, id, venta.earned_points]
+            );
+        }
+
+        // ✅ Generar el asiento contrario exacto al original
+        await reversarAsiento(connection, {
+            reference_type: 'venta',
+            original_reference_id: id,
+            new_reference_id: id,
+            description: `Reversión de Venta #${id}${reason ? ': ' + reason : ''}`,
+            user_id
+        });
+
+        await connection.query(
+            `UPDATE ventas 
+             SET status = 'cancelada', cancelled_at = NOW(), cancelled_by = ?, cancel_reason = ? 
+             WHERE id = ?`,
+            [user_id, reason || null, id]
+        );
+
+        await connection.commit();
+        res.json({ message: "Venta cancelada con éxito" });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("❌ Error al cancelar la venta:", error);
+        res.status(500).json({ error: "Error al cancelar la venta" });
     } finally {
         connection.release();
     }
@@ -245,7 +354,8 @@ router.get('/', async (req, res) => {
             CONCAT(c.first_name, ' ', c.last_name) AS cliente,
             v.total,
             v.earned_points,
-            v.sale_date
+            v.sale_date,
+            v.status
         FROM ventas v
         JOIN usuarios u ON v.user_id = u.id
         LEFT JOIN clientes c ON v.customer_id = c.id
@@ -262,160 +372,6 @@ router.get('/', async (req, res) => {
 });
 
 // ========================
-// POST /ventas/rapida
-// Registra una venta SIN inventario asociado — para productos que aún
-// no están cargados en el sistema (ej. maquillaje en tránsito de subir).
-// A diferencia de una venta normal: no descuenta stock, no genera
-// puntos (no hay producto para calcular el margen), no requiere
-// productos[]. SÍ exige caja abierta igual que cualquier venta, y SÍ
-// genera el asiento correcto contra Ventas (4101) — así el ingreso
-// aparece en el Estado de Resultados donde debe estar, no como
-// "Otros Ingresos".
-//
-// Cuando subas el inventario real de esos productos, esta venta queda
-// como está — no hace falta "corregirla" ni migrarla, es historia.
-// ========================
-router.post('/rapida', async (req, res) => {
-    const {
-        user_id,
-        customer_id,
-        payment_type,
-        payment_status,
-        payment_method,
-        bank_id,
-        total,
-        paid_amount,
-        pending_amount,
-        concept
-    } = req.body;
-
-    if (!user_id || !total || total <= 0) {
-        return res.status(400).json({ error: "Usuario y un monto válido son obligatorios." });
-    }
-
-    const validPaymentTypes = ['cash', 'credit', 'mixed'];
-    if (!validPaymentTypes.includes(payment_type)) {
-        return res.status(400).json({ error: "Forma de pago inválida." });
-    }
-
-    if ((payment_type === 'credit' || payment_type === 'mixed') && !customer_id) {
-        return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
-    }
-
-    const normalizedPaymentMethod = payment_method || 'cash';
-    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
-
-    if (entraDinero) {
-        const validMethods = ['cash', 'transfer', 'card'];
-        if (!validMethods.includes(normalizedPaymentMethod)) {
-            return res.status(400).json({ error: "Método de pago inválido." });
-        }
-        if ((normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card') && !bank_id) {
-            return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
-        }
-    }
-
-    const connection = await db.getConnection();
-
-    try {
-        await connection.beginTransaction();
-
-        let cajaAbierta = null;
-        let bankAccount = null;
-
-        // ✅ Caja abierta obligatoria, igual que cualquier venta
-        const [cajaResult] = await connection.query(
-            "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
-            [user_id]
-        );
-
-        if (!cajaResult.length) {
-            await connection.rollback();
-            return res.status(400).json({ error: "Debes abrir tu caja antes de registrar ventas." });
-        }
-
-        cajaAbierta = cajaResult[0];
-
-        if (entraDinero && (normalizedPaymentMethod === 'transfer' || normalizedPaymentMethod === 'card')) {
-            const [bankResult] = await connection.query(
-                "SELECT id FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
-                [bank_id]
-            );
-
-            if (!bankResult.length) {
-                await connection.rollback();
-                return res.status(404).json({ error: "Cuenta bancaria no encontrada o inactiva." });
-            }
-
-            bankAccount = bankResult[0];
-        }
-
-        // ✅ Venta sin productos — earned_points siempre 0 porque no hay
-        // forma de calcular margen sin costo de inventario conocido
-        const [ventaResult] = await connection.query(
-            `INSERT INTO ventas 
-                (user_id, customer_id, payment_type, payment_status, payment_method, bank_id, total, paid_amount, pending_amount, earned_points) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-            [user_id, customer_id || null, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, total, paid_amount, pending_amount]
-        );
-        const sale_id = ventaResult.insertId;
-
-        const conceptoFinal = concept?.trim() || `Venta #${sale_id} sin inventario cargado`;
-
-        if (entraDinero && normalizedPaymentMethod === 'cash') {
-            await connection.query(
-                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
-                 VALUES (?, 'income', ?, ?, 'venta', ?)`,
-                [cajaAbierta.id, conceptoFinal, paid_amount, sale_id]
-            );
-        }
-
-        if (bankAccount) {
-            await connection.query(
-                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
-                 VALUES (?, 'transfer_in', ?, ?, 'venta', ?)`,
-                [bank_id, paid_amount, conceptoFinal, sale_id]
-            );
-
-            await connection.query(
-                "UPDATE bancos SET current_balance = current_balance + ? WHERE id = ?",
-                [paid_amount, bank_id]
-            );
-        }
-
-        // ✅ Asiento: va a 4101 - Ventas, exactamente como una venta normal.
-        // Sin línea de Costo de Ventas (5101) porque no conocemos el costo
-        // real de esa mercancía todavía.
-        const cuentaDinero = normalizedPaymentMethod === 'cash' ? '1101' : '1102';
-        const lines = [{ code: '4101', credit: total }];
-
-        if (paid_amount > 0) {
-            lines.push({ code: cuentaDinero, debit: paid_amount });
-        }
-        if (pending_amount > 0) {
-            lines.push({ code: '1103', debit: pending_amount });
-        }
-
-        await crearAsiento(connection, {
-            description: conceptoFinal,
-            reference_type: 'venta',
-            reference_id: sale_id,
-            user_id,
-            lines
-        });
-
-        await connection.commit();
-        res.json({ message: "Venta registrada con éxito (sin inventario)", sale_id });
-
-    } catch (error) {
-        await connection.rollback();
-        console.error("❌ Error al registrar venta rápida:", error);
-        res.status(500).json({ error: "Error al registrar la venta" });
-    } finally {
-        connection.release();
-    }
-});
-// ========================
 // GET /ventas/:id
 // ========================
 router.get('/:id', async (req, res) => {
@@ -423,7 +379,7 @@ router.get('/:id', async (req, res) => {
 
     try {
         const [venta] = await db.query(`
-            SELECT v.id, v.total, v.sale_date, u.username, 
+            SELECT v.id, v.total, v.sale_date, v.status, v.cancel_reason, u.username, 
                    CONCAT(c.first_name, ' ', c.last_name) AS customer
             FROM ventas v
             JOIN usuarios u ON v.user_id = u.id

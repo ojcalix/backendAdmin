@@ -22,7 +22,7 @@ router.get('/', async (req, res) => {
                 c.payment_status
             FROM compras c
             INNER JOIN proveedores p ON c.supplier_id = p.id
-            WHERE c.payment_status IN ('pending', 'partial')
+            WHERE c.payment_status IN ('pending', 'partial') AND c.status = 'completada'
         `;
 
         const params = [];

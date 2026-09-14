@@ -3,13 +3,6 @@ const router = express.Router();
 const db = require('../config/db');
 const { crearAsiento } = require('../helpers/contabilidad');
 
-// ========================
-// Genera la tabla de amortización con cuota fija ingresada por el usuario.
-// El monto de CADA cuota, incluida la última, es SIEMPRE monthly_payment
-// exacto (así te la cobra el banco). La diferencia de centavos que deja
-// el redondeo del interés se absorbe en el interés de la última cuota,
-// nunca en el monto total mostrado al usuario.
-// ========================
 function generarCuotas(principal, interestRateAnual, termMonths, monthlyPayment, disbursementDate) {
     const monthlyRate = interestRateAnual / 100 / 12;
     let saldo = principal;
@@ -27,7 +20,7 @@ function generarCuotas(principal, interestRateAnual, termMonths, monthlyPayment,
 
         if (esUltima) {
             principalPortion = parseFloat(saldo.toFixed(2));
-            amount = monthlyPayment; // ✅ fijo siempre, igual que las demás
+            amount = monthlyPayment;
             interestPortion = parseFloat((amount - principalPortion).toFixed(2));
             saldo = 0;
         } else {
@@ -70,7 +63,6 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /prestamos/:id
-// Detalle completo con cargos, tabla de amortización y abonos a capital
 // ========================
 router.get('/:id', async (req, res) => {
     try {
@@ -98,12 +90,18 @@ router.get('/:id', async (req, res) => {
 
 // ========================
 // POST /prestamos
+// Distingue cargos "descontados" (reducen el depósito, el banco los
+// resta antes de darte el dinero) de cargos "aparte" (recibes el
+// préstamo COMPLETO, y esos cargos se pagan como un desembolso
+// independiente, con su propia fuente de pago — puede ser distinta
+// a la del desembolso, ej. préstamo a banco, seguro pagado en efectivo).
 // ========================
 router.post('/', async (req, res) => {
     const {
         lender_name, principal_amount, interest_rate, term_months, monthly_payment,
         commission_type, commission_amount, disbursement_method, bank_id,
-        disbursement_date, user_id, notes, cargos
+        disbursement_date, user_id, notes, cargos,
+        aparte_payment_method, aparte_bank_id
     } = req.body;
 
     if (!lender_name || !principal_amount || !interest_rate || !term_months || !monthly_payment || !disbursement_date || !user_id) {
@@ -121,12 +119,31 @@ router.post('/', async (req, res) => {
 
     const cargosList = Array.isArray(cargos) ? cargos : [];
     const commissionAmt = commission_type !== 'ninguna' ? (parseFloat(commission_amount) || 0) : 0;
-    const cargosTotal = cargosList.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0);
-    const totalCharges = commissionAmt + cargosTotal;
-    const netReceived = parseFloat(principal_amount) - totalCharges;
+
+    // ✅ Separación real: solo lo "descontado" reduce lo que te depositan.
+    // Lo "aparte" no toca el depósito — se paga como un desembolso separado.
+    const commissionDescontada = commission_type === 'descontada' ? commissionAmt : 0;
+    const commissionAparte = commission_type === 'aparte' ? commissionAmt : 0;
+
+    const cargosDescontados = cargosList.filter(c => (c.charge_type || 'descontado') === 'descontado');
+    const cargosAparte = cargosList.filter(c => c.charge_type === 'aparte');
+
+    const totalDescontado = commissionDescontada + cargosDescontados.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0);
+    const totalAparte = commissionAparte + cargosAparte.reduce((sum, c) => sum + (parseFloat(c.amount) || 0), 0);
+
+    const netReceived = parseFloat(principal_amount) - totalDescontado;
 
     if (netReceived < 0) {
-        return res.status(400).json({ error: "Los cargos y comisión no pueden ser mayores al monto del préstamo." });
+        return res.status(400).json({ error: "Los cargos descontados no pueden ser mayores al monto del préstamo." });
+    }
+
+    if (totalAparte > 0) {
+        if (!aparte_payment_method) {
+            return res.status(400).json({ error: "Debe indicar cómo pagará los cargos que van aparte." });
+        }
+        if ((aparte_payment_method === 'transfer' || aparte_payment_method === 'card') && !aparte_bank_id) {
+            return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria para pagar los cargos aparte." });
+        }
     }
 
     const connection = await db.getConnection();
@@ -134,6 +151,7 @@ router.post('/', async (req, res) => {
     try {
         await connection.beginTransaction();
 
+        // ---- Fondos del DESEMBOLSO (recibir el préstamo) ----
         let cajaAbierta = null;
         let bankAccount = null;
 
@@ -161,6 +179,61 @@ router.post('/', async (req, res) => {
             }
 
             bankAccount = bankResult[0];
+        }
+
+        // ---- Fondos para PAGAR LOS CARGOS APARTE (puede ser otra fuente) ----
+        let aparteCajaAbierta = null;
+        let aparteBankAccount = null;
+
+        if (totalAparte > 0) {
+            if (aparte_payment_method === 'cash') {
+                const [cajaResult] = await connection.query(
+                    "SELECT id, opening_amount FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1 FOR UPDATE",
+                    [user_id]
+                );
+
+                if (!cajaResult.length) {
+                    await connection.rollback();
+                    return res.status(400).json({ error: "Debes abrir tu caja para pagar los cargos aparte en efectivo." });
+                }
+
+                aparteCajaAbierta = cajaResult[0];
+
+                const [movResult] = await connection.query(
+                    `SELECT 
+                        COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS total_income,
+                        COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS total_expense
+                     FROM movimientos_caja WHERE caja_id = ?`,
+                    [aparteCajaAbierta.id]
+                );
+
+                const availableCash = parseFloat(aparteCajaAbierta.opening_amount)
+                    + parseFloat(movResult[0].total_income)
+                    - parseFloat(movResult[0].total_expense);
+
+                if (totalAparte > availableCash) {
+                    await connection.rollback();
+                    return res.status(400).json({ error: `Saldo insuficiente en caja para pagar los cargos aparte. Disponible: L. ${availableCash.toFixed(2)}` });
+                }
+
+            } else if (aparte_payment_method === 'transfer' || aparte_payment_method === 'card') {
+                const [bankResult] = await connection.query(
+                    "SELECT id, current_balance FROM bancos WHERE id = ? AND status = 'active' FOR UPDATE",
+                    [aparte_bank_id]
+                );
+
+                if (!bankResult.length) {
+                    await connection.rollback();
+                    return res.status(404).json({ error: "Cuenta bancaria (cargos aparte) no encontrada o inactiva." });
+                }
+
+                aparteBankAccount = bankResult[0];
+
+                if (totalAparte > parseFloat(aparteBankAccount.current_balance)) {
+                    await connection.rollback();
+                    return res.status(400).json({ error: `Saldo insuficiente en el banco para pagar los cargos aparte. Disponible: L. ${parseFloat(aparteBankAccount.current_balance).toFixed(2)}` });
+                }
+            }
         }
 
         const [prestamoResult] = await connection.query(
@@ -194,6 +267,7 @@ router.post('/', async (req, res) => {
             );
         }
 
+        // ---- Movimiento del DESEMBOLSO (neto, ya sin lo descontado) ----
         if (cajaAbierta) {
             await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
@@ -218,8 +292,8 @@ router.post('/', async (req, res) => {
         const cuentaDinero = disbursement_method === 'cash' ? '1101' : '1102';
         const lines = [{ code: cuentaDinero, debit: netReceived }];
 
-        if (totalCharges > 0) {
-            lines.push({ code: '6104', debit: totalCharges });
+        if (totalDescontado > 0) {
+            lines.push({ code: '6104', debit: totalDescontado });
         }
 
         lines.push({ code: '2105', credit: parseFloat(principal_amount) });
@@ -232,8 +306,52 @@ router.post('/', async (req, res) => {
             lines
         });
 
+        // ---- Pago INMEDIATO de los cargos "aparte" (desembolso separado) ----
+        if (totalAparte > 0) {
+            const concept = `Pago de cargos aparte - Préstamo ${lender_name}`;
+
+            if (aparteCajaAbierta) {
+                await connection.query(
+                    `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                     VALUES (?, 'expense', ?, ?, 'otro', ?)`,
+                    [aparteCajaAbierta.id, concept, totalAparte, prestamoId]
+                );
+            }
+
+            if (aparteBankAccount) {
+                await connection.query(
+                    `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                     VALUES (?, 'transfer_out', ?, ?, 'otro', ?)`,
+                    [aparte_bank_id, totalAparte, concept, prestamoId]
+                );
+
+                await connection.query(
+                    "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
+                    [totalAparte, aparte_bank_id]
+                );
+            }
+
+            const cuentaOrigenAparte = aparte_payment_method === 'cash' ? '1101' : '1102';
+
+            await crearAsiento(connection, {
+                description: concept,
+                reference_type: 'ajuste',
+                reference_id: prestamoId,
+                user_id,
+                lines: [
+                    { code: '6104', debit: totalAparte },
+                    { code: cuentaOrigenAparte, credit: totalAparte }
+                ]
+            });
+        }
+
         await connection.commit();
-        res.json({ message: "Préstamo registrado con éxito", prestamo_id: prestamoId, net_received: netReceived });
+        res.json({
+            message: "Préstamo registrado con éxito",
+            prestamo_id: prestamoId,
+            net_received: netReceived,
+            total_aparte_pagado: totalAparte
+        });
 
     } catch (error) {
         await connection.rollback();
@@ -246,11 +364,6 @@ router.post('/', async (req, res) => {
 
 // ========================
 // PUT /prestamos/:id
-// Editar préstamo. Si NO tiene pagos registrados, se puede cambiar
-// cualquier dato financiero (tasa, cuota, plazo) y la tabla de
-// amortización se regenera desde cero. Si YA tiene pagos, esos campos
-// quedan bloqueados (cambiarlos corrompería el historial contable ya
-// registrado) — solo se permite editar nombre, notas y fecha.
 // ========================
 router.put('/:id', async (req, res) => {
     const { id } = req.params;
@@ -299,7 +412,6 @@ router.put('/:id', async (req, res) => {
         );
 
         if (wantsFinancialChange && !hasPayments) {
-            // Sin pagos aún: seguro regenerar toda la tabla de amortización
             await connection.query(`DELETE FROM cuotas_prestamo WHERE prestamo_id = ?`, [id]);
 
             const cuotas = generarCuotas(
@@ -329,10 +441,6 @@ router.put('/:id', async (req, res) => {
 
 // ========================
 // POST /prestamos/pago
-// Registra el pago de una cuota (completo o parcial). El monto NO puede
-// exceder el saldo de esa cuota — si el usuario quiere pagar de más,
-// eso es un "Abono a Capital" (endpoint separado abajo), no un pago
-// de cuota normal.
 // ========================
 router.post('/pago', async (req, res) => {
     const { cuota_id, amount, payment_method, bank_id, user_id, notes } = req.body;
@@ -520,10 +628,6 @@ router.post('/pago', async (req, res) => {
 
 // ========================
 // POST /prestamos/:id/abono-capital
-// Abono extraordinario a capital: reduce la deuda directamente y
-// REAMORTIZA todas las cuotas pendientes con la cuota mensual fija
-// (la que ya cobra el banco) — el préstamo simplemente termina antes.
-// Las cuotas que ya no hacen falta quedan en L. 0.00 con estado "Pagada".
 // ========================
 router.post('/:id/abono-capital', async (req, res) => {
     const { id } = req.params;
@@ -652,8 +756,6 @@ router.post('/:id/abono-capital', async (req, res) => {
                 saldo = parseFloat((saldo - principalPortion).toFixed(2));
             }
 
-            // Si esta cuota ya tenía un abono parcial previo, se conserva
-            // lo ya pagado (paid_amount/interest_paid/principal_paid no se tocan)
             await connection.query(
                 `UPDATE cuotas_prestamo SET amount=?, interest_portion=?, principal_portion=? WHERE id=?`,
                 [amountCuota, interestPortion, principalPortion, cuota.id]

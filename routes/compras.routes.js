@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
-const { crearAsiento } = require('../helpers/contabilidad');
+const { crearAsiento, reversarAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // GET /compras/fuentes-financiamiento
@@ -46,6 +46,8 @@ router.post('/apertura', async (req, res) => {
             total += parseFloat(p.purchase_price) * parseInt(p.quantity);
         }
 
+        total = parseFloat(total.toFixed(2));
+
         if (total <= 0) {
             await connection.rollback();
             return res.status(400).json({ error: "El total debe ser mayor a cero." });
@@ -53,40 +55,32 @@ router.post('/apertura', async (req, res) => {
 
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_method, payment_status, purchase_price, shipping_cost, paid_amount, pending_amount) 
-             VALUES (NULL, ?, 'cash', 'cash', 'paid', ?, 0, ?, 0)`,
+                (supplier_id, user_id, payment_type, payment_method, payment_status, purchase_price, paid_amount, pending_amount) 
+             VALUES (NULL, ?, 'cash', 'cash', 'paid', ?, ?, 0)`,
             [user_id, total, total]
         );
         const purchase_id = compraResult.insertId;
 
         for (const p of products) {
-            const [variantRows] = await connection.query(
-                "SELECT id, quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+            const [variantExists] = await connection.query(
+                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
                 [p.variant_id, p.product_id]
             );
 
-            if (!variantRows.length) {
+            if (!variantExists.length) {
                 await connection.rollback();
                 return res.status(400).json({ error: `Variante no encontrada (ID: ${p.variant_id})` });
             }
 
-            const variant = variantRows[0];
-            const oldQty = parseInt(variant.quantity);
-            const oldCost = parseFloat(variant.average_cost);
-            const newQty = oldQty + parseInt(p.quantity);
-            const newAvgCost = newQty > 0
-                ? ((oldQty * oldCost) + (parseInt(p.quantity) * parseFloat(p.purchase_price))) / newQty
-                : 0;
-
             await connection.query(
                 `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-     VALUES (?, ?, ?, ?, ?)`,
+                 VALUES (?, ?, ?, ?, ?)`,
                 [purchase_id, p.product_id, p.variant_id, p.quantity, p.purchase_price]
             );
 
             await connection.query(
-                "UPDATE variantes SET quantity = ?, average_cost = ? WHERE id = ?",
-                [newQty, newAvgCost, p.variant_id]
+                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
+                [p.quantity, p.variant_id]
             );
         }
 
@@ -115,11 +109,11 @@ router.post('/apertura', async (req, res) => {
 
 // ========================
 // POST /compras
-// Ahora recibe products_amount (subtotal de productos) y shipping_cost
-// por separado. El total de la compra (purchase_price almacenado) es
-// la suma de ambos. El envío NO se capitaliza al inventario — se
-// contabiliza como gasto (6102), para no afectar el costo promedio
-// por unidad de cada variante.
+// ✅ CORREGIDO: purchase_price ya NO se toma del body tal cual venga del
+// frontend. Se recalcula sumando paid_amount + pending_amount, que sí
+// vienen bien calculados desde el detalle de productos. Esto evita que
+// un total mal calculado en el frontend (NaN → null) descuadre el
+// asiento contable, como pasó antes.
 // ========================
 router.post('/', async (req, res) => {
     const {
@@ -130,8 +124,6 @@ router.post('/', async (req, res) => {
         payment_method,
         bank_id,
         financing_source_id,
-        products_amount,
-        shipping_cost,
         paid_amount,
         pending_amount,
         products
@@ -146,16 +138,18 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Forma de pago inválida." });
     }
 
-    const normalizedPaymentMethod = payment_method || 'cash';
-    const normalizedProductsAmount = parseFloat(products_amount) || 0;
-    const normalizedShippingCost = parseFloat(shipping_cost) || 0;
-    const totalPurchase = normalizedProductsAmount + normalizedShippingCost;
+    // ✅ Recalcular el total desde cero, nunca confiar en purchase_price del frontend
+    const paidAmountNum = parseFloat(paid_amount) || 0;
+    const pendingAmountNum = parseFloat(pending_amount) || 0;
+    const totalRecalculado = parseFloat((paidAmountNum + pendingAmountNum).toFixed(2));
 
-    if (normalizedProductsAmount <= 0) {
-        return res.status(400).json({ error: "El subtotal de productos debe ser mayor a cero." });
+    if (totalRecalculado <= 0) {
+        return res.status(400).json({ error: "El total de la compra debe ser mayor a cero (revisa los montos)." });
     }
 
-    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
+    const normalizedPaymentMethod = payment_method || 'cash';
+
+    const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paidAmountNum > 0;
 
     if (entraDinero) {
         const validMethods = ['cash', 'transfer', 'card', 'financing'];
@@ -166,7 +160,7 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: "Debe seleccionar una cuenta bancaria." });
         }
         if (normalizedPaymentMethod === 'financing' && !financing_source_id) {
-            return res.status(400).json({ error: "Debe seleccionar una fuente de financiamiento (tarjeta, propietario, etc.)." });
+            return res.status(400).json({ error: "Debe seleccionar una fuente de financiamiento." });
         }
     }
 
@@ -204,7 +198,7 @@ router.post('/', async (req, res) => {
                 + parseFloat(movResult[0].total_income)
                 - parseFloat(movResult[0].total_expense);
 
-            if (parseFloat(paid_amount) > availableCash) {
+            if (paidAmountNum > availableCash) {
                 await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en caja. Disponible: L. ${availableCash.toFixed(2)}`
@@ -225,7 +219,7 @@ router.post('/', async (req, res) => {
 
             bankAccount = bankResult[0];
 
-            if (parseFloat(paid_amount) > parseFloat(bankAccount.current_balance)) {
+            if (paidAmountNum > parseFloat(bankAccount.current_balance)) {
                 await connection.rollback();
                 return res.status(400).json({
                     error: `Saldo insuficiente en el banco. Disponible: L. ${parseFloat(bankAccount.current_balance).toFixed(2)}`
@@ -247,7 +241,7 @@ router.post('/', async (req, res) => {
             financingSource = sourceResult[0];
 
             if (financingSource.credit_limit !== null) {
-                const nuevoSaldo = parseFloat(financingSource.current_balance) + parseFloat(paid_amount);
+                const nuevoSaldo = parseFloat(financingSource.current_balance) + paidAmountNum;
                 if (nuevoSaldo > parseFloat(financingSource.credit_limit)) {
                     await connection.rollback();
                     return res.status(400).json({
@@ -259,9 +253,9 @@ router.post('/', async (req, res) => {
 
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, shipping_cost, paid_amount, pending_amount) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, totalPurchase, normalizedShippingCost, paid_amount, pending_amount]
+                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, totalRecalculado, paidAmountNum, pendingAmountNum]
         );
         const purchase_id = compraResult.insertId;
 
@@ -273,7 +267,7 @@ router.post('/', async (req, res) => {
             await connection.query(
                 `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
                  VALUES (?, 'expense', ?, ?, 'compra', ?)`,
-                [cajaAbierta.id, concept, paid_amount, purchase_id]
+                [cajaAbierta.id, concept, paidAmountNum, purchase_id]
             );
         }
 
@@ -285,12 +279,12 @@ router.post('/', async (req, res) => {
             await connection.query(
                 `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
                  VALUES (?, 'transfer_out', ?, ?, 'compra', ?)`,
-                [bank_id, paid_amount, concept, purchase_id]
+                [bank_id, paidAmountNum, concept, purchase_id]
             );
 
             await connection.query(
                 "UPDATE bancos SET current_balance = current_balance - ? WHERE id = ?",
-                [paid_amount, bank_id]
+                [paidAmountNum, bank_id]
             );
         }
 
@@ -300,12 +294,12 @@ router.post('/', async (req, res) => {
             await connection.query(
                 `INSERT INTO movimientos_financiamiento (financing_source_id, type, amount, concept, reference_type, reference_id) 
                  VALUES (?, 'charge', ?, ?, 'compra', ?)`,
-                [financingSource.id, paid_amount, concept, purchase_id]
+                [financingSource.id, paidAmountNum, concept, purchase_id]
             );
 
             await connection.query(
                 "UPDATE fuentes_financiamiento SET current_balance = current_balance + ? WHERE id = ?",
-                [paid_amount, financingSource.id]
+                [paidAmountNum, financingSource.id]
             );
         }
 
@@ -317,39 +311,28 @@ router.post('/', async (req, res) => {
                 return res.status(400).json({ error: `Falta la variante para el producto (ID: ${product_id})` });
             }
 
-            const [variantRows] = await connection.query(
-                "SELECT id, quantity, average_cost FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
+            const [variantExists] = await connection.query(
+                "SELECT id FROM variantes WHERE id = ? AND product_id = ? FOR UPDATE",
                 [variant_id, product_id]
             );
 
-            if (!variantRows.length) {
+            if (!variantExists.length) {
                 await connection.rollback();
                 return res.status(400).json({ error: `Variante no encontrada (ID: ${variant_id})` });
             }
 
-            const variant = variantRows[0];
-            const oldQty = parseInt(variant.quantity);
-            const oldCost = parseFloat(variant.average_cost);
-            const newQty = oldQty + parseInt(quantity);
-            const newAvgCost = newQty > 0
-                ? ((oldQty * oldCost) + (parseInt(quantity) * parseFloat(linePrice))) / newQty
-                : 0;
-
             await connection.query(
                 `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-     VALUES (?, ?, ?, ?, ?)`,
+                 VALUES (?, ?, ?, ?, ?)`,
                 [purchase_id, product_id, variant_id, quantity, linePrice]
             );
 
             await connection.query(
-                "UPDATE variantes SET quantity = ?, average_cost = ? WHERE id = ?",
-                [newQty, newAvgCost, variant_id]
+                "UPDATE variantes SET quantity = quantity + ? WHERE id = ?",
+                [quantity, variant_id]
             );
         }
 
-        // ✅ Asiento contable: el costo de productos capitaliza a Inventario (1104);
-        // el envío, si lo hay, va a Gastos de Compras (6102) — no se mezcla con
-        // el costo promedio de las variantes.
         let cuentaDineroCode;
         if (normalizedPaymentMethod === 'cash') {
             cuentaDineroCode = '1101';
@@ -363,17 +346,13 @@ router.post('/', async (req, res) => {
             cuentaDineroCode = accountRow[0].code;
         }
 
-        const lines = [{ code: '1104', debit: normalizedProductsAmount }];
+        const lines = [{ code: '1104', debit: totalRecalculado }];
 
-        if (normalizedShippingCost > 0) {
-            lines.push({ code: '6102', debit: normalizedShippingCost, description: 'Costo de envío' });
+        if (paidAmountNum > 0) {
+            lines.push({ code: cuentaDineroCode, credit: paidAmountNum });
         }
-
-        if (paid_amount > 0) {
-            lines.push({ code: cuentaDineroCode, credit: paid_amount });
-        }
-        if (pending_amount > 0) {
-            lines.push({ code: '2101', credit: pending_amount });
+        if (pendingAmountNum > 0) {
+            lines.push({ code: '2101', credit: pendingAmountNum });
         }
 
         await crearAsiento(connection, {
@@ -397,6 +376,148 @@ router.post('/', async (req, res) => {
 });
 
 // ========================
+// POST /compras/:id/cancelar
+// ========================
+router.post('/:id/cancelar', async (req, res) => {
+    const { id } = req.params;
+    const { user_id, reason } = req.body;
+
+    if (!user_id) {
+        return res.status(400).json({ error: "Falta el usuario que cancela la compra." });
+    }
+
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        const [compraResult] = await connection.query(
+            "SELECT * FROM compras WHERE id = ? FOR UPDATE",
+            [id]
+        );
+
+        if (!compraResult.length) {
+            await connection.rollback();
+            return res.status(404).json({ error: "Compra no encontrada." });
+        }
+
+        const compra = compraResult[0];
+
+        if (compra.status === 'cancelada') {
+            await connection.rollback();
+            return res.status(400).json({ error: "Esta compra ya está cancelada." });
+        }
+
+        const [pagos] = await connection.query(
+            "SELECT COUNT(*) AS total FROM pagos_proveedores WHERE purchase_id = ?",
+            [id]
+        );
+
+        if (pagos[0].total > 0) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: "Esta compra ya tiene pagos registrados. Debes cancelar esos pagos primero."
+            });
+        }
+
+        const [detalle] = await connection.query(
+            "SELECT variant_id, quantity FROM detalle_compras WHERE purchase_id = ?",
+            [id]
+        );
+
+        for (const item of detalle) {
+            const [variantRow] = await connection.query(
+                "SELECT variant_name, quantity FROM variantes WHERE id = ? FOR UPDATE",
+                [item.variant_id]
+            );
+
+            if (!variantRow.length || variantRow[0].quantity < item.quantity) {
+                await connection.rollback();
+                return res.status(400).json({
+                    error: `No se puede cancelar: ya se vendió parte del stock de "${variantRow[0]?.variant_name || 'una variante'}" que entró en esta compra.`
+                });
+            }
+        }
+
+        for (const item of detalle) {
+            await connection.query(
+                "UPDATE variantes SET quantity = quantity - ? WHERE id = ?",
+                [item.quantity, item.variant_id]
+            );
+        }
+
+        if (compra.paid_amount > 0 && compra.payment_method === 'cash') {
+            const [cajaResult] = await connection.query(
+                "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
+                [user_id]
+            );
+
+            if (!cajaResult.length) {
+                await connection.rollback();
+                return res.status(400).json({ error: "Debes abrir tu caja para poder cancelar una compra en efectivo (el reverso se registra en tu caja actual)." });
+            }
+
+            await connection.query(
+                `INSERT INTO movimientos_caja (caja_id, type, concept, amount, reference_type, reference_id) 
+                 VALUES (?, 'income', ?, ?, 'compra', ?)`,
+                [cajaResult[0].id, `Cancelación de compra #${id}`, compra.paid_amount, id]
+            );
+        }
+
+        if (compra.paid_amount > 0 && (compra.payment_method === 'transfer' || compra.payment_method === 'card')) {
+            await connection.query(
+                `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'transfer_in', ?, ?, 'compra', ?)`,
+                [compra.bank_id, compra.paid_amount, `Cancelación de compra #${id}`, id]
+            );
+
+            await connection.query(
+                "UPDATE bancos SET current_balance = current_balance + ? WHERE id = ?",
+                [compra.paid_amount, compra.bank_id]
+            );
+        }
+
+        if (compra.paid_amount > 0 && compra.payment_method === 'financing' && compra.financing_source_id) {
+            await connection.query(
+                `INSERT INTO movimientos_financiamiento (financing_source_id, type, amount, concept, reference_type, reference_id) 
+                 VALUES (?, 'payment', ?, ?, 'compra', ?)`,
+                [compra.financing_source_id, compra.paid_amount, `Cancelación de compra #${id}`, id]
+            );
+
+            await connection.query(
+                "UPDATE fuentes_financiamiento SET current_balance = current_balance - ? WHERE id = ?",
+                [compra.paid_amount, compra.financing_source_id]
+            );
+        }
+
+        await reversarAsiento(connection, {
+            reference_type: 'compra',
+            original_reference_id: id,
+            new_reference_id: id,
+            description: `Reversión de Compra #${id}${reason ? ': ' + reason : ''}`,
+            user_id
+        });
+
+        await connection.query(
+            `UPDATE compras 
+             SET status = 'cancelada', cancelled_at = NOW(), cancelled_by = ?, cancel_reason = ? 
+             WHERE id = ?`,
+            [user_id, reason || null, id]
+        );
+
+        await connection.commit();
+        res.json({ message: "Compra cancelada con éxito" });
+
+    } catch (error) {
+        await connection.rollback();
+        console.error("❌ Error al cancelar la compra:", error);
+        res.status(500).json({ error: "Error al cancelar la compra" });
+    } finally {
+        connection.release();
+    }
+});
+
+// ========================
 // GET /compras
 // ========================
 router.get('/', async (req, res) => {
@@ -407,8 +528,8 @@ router.get('/', async (req, res) => {
                 COALESCE(p.name, 'Apertura de Inventario') AS proveedor,
                 u.username AS usuario,
                 c.purchase_price,
-                c.shipping_cost,
                 c.payment_status,
+                c.status,
                 c.purchase_date,
                 (c.supplier_id IS NULL) AS is_opening_balance
             FROM compras c 
@@ -434,8 +555,8 @@ router.get('/:id(\\d+)', async (req, res) => {
 
         const [compra] = await db.query(`
             SELECT 
-                c.id, c.purchase_price, c.shipping_cost, c.purchase_date, c.payment_type, c.payment_status,
-                c.payment_method, c.paid_amount, c.pending_amount,
+                c.id, c.purchase_price, c.purchase_date, c.payment_type, c.payment_status,
+                c.payment_method, c.paid_amount, c.pending_amount, c.status, c.cancel_reason,
                 u.username, COALESCE(pr.name, 'Apertura de Inventario') AS proveedor,
                 ff.name AS financing_source_name,
                 (c.supplier_id IS NULL) AS is_opening_balance
@@ -462,16 +583,7 @@ router.get('/:id(\\d+)', async (req, res) => {
             WHERE dc.purchase_id = ?
         `, [id]);
 
-        // Gastos posteriores vinculados a esta compra (ej. envío pagado después)
-        const [gastosVinculados] = await db.query(`
-            SELECT g.id, g.concept, g.amount, g.date, cg.name AS category_name
-            FROM gastos g
-            INNER JOIN categorias_gastos cg ON g.category_id = cg.id
-            WHERE g.purchase_id = ?
-            ORDER BY g.date ASC
-        `, [id]);
-
-        res.json({ compra: compra[0], productos: detalle, gastos_vinculados: gastosVinculados });
+        res.json({ compra: compra[0], productos: detalle });
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Error al obtener la compra' });

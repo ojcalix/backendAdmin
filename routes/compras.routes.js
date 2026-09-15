@@ -73,9 +73,9 @@ router.post('/apertura', async (req, res) => {
             }
 
             await connection.query(
-                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-                 VALUES (?, ?, ?, ?, ?)`,
-                [purchase_id, p.product_id, p.variant_id, p.quantity, p.purchase_price]
+                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price, list_price, is_promotional, price_note) 
+                 VALUES (?, ?, ?, ?, ?, ?, FALSE, NULL)`,
+                [purchase_id, p.product_id, p.variant_id, p.quantity, p.purchase_price, p.purchase_price]
             );
 
             await connection.query(
@@ -109,11 +109,10 @@ router.post('/apertura', async (req, res) => {
 
 // ========================
 // POST /compras
-// ✅ CORREGIDO: purchase_price ya NO se toma del body tal cual venga del
-// frontend. Se recalcula sumando paid_amount + pending_amount, que sí
-// vienen bien calculados desde el detalle de productos. Esto evita que
-// un total mal calculado en el frontend (NaN → null) descuadre el
-// asiento contable, como pasó antes.
+// ✅ Cada producto ahora puede traer list_price (el precio de lista que
+// se sugirió originalmente), is_promotional y price_note. Si el
+// frontend no los manda (compatibilidad hacia atrás), se asume que
+// purchase_price = list_price y que no es promocional.
 // ========================
 router.post('/', async (req, res) => {
     const {
@@ -138,7 +137,6 @@ router.post('/', async (req, res) => {
         return res.status(400).json({ error: "Forma de pago inválida." });
     }
 
-    // ✅ Recalcular el total desde cero, nunca confiar en purchase_price del frontend
     const paidAmountNum = parseFloat(paid_amount) || 0;
     const pendingAmountNum = parseFloat(pending_amount) || 0;
     const totalRecalculado = parseFloat((paidAmountNum + pendingAmountNum).toFixed(2));
@@ -304,7 +302,10 @@ router.post('/', async (req, res) => {
         }
 
         for (const product of products) {
-            const { product_id, variant_id, quantity, purchase_price: linePrice } = product;
+            const {
+                product_id, variant_id, quantity,
+                purchase_price: linePrice, list_price, is_promotional, price_note
+            } = product;
 
             if (!variant_id) {
                 await connection.rollback();
@@ -321,10 +322,14 @@ router.post('/', async (req, res) => {
                 return res.status(400).json({ error: `Variante no encontrada (ID: ${variant_id})` });
             }
 
+            // ✅ Si el frontend no mandó list_price, se asume igual al precio pagado
+            const listPriceFinal = (list_price !== undefined && list_price !== null) ? list_price : linePrice;
+            const isPromo = !!is_promotional;
+
             await connection.query(
-                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price) 
-                 VALUES (?, ?, ?, ?, ?)`,
-                [purchase_id, product_id, variant_id, quantity, linePrice]
+                `INSERT INTO detalle_compras (purchase_id, product_id, variant_id, quantity, purchase_price, list_price, is_promotional, price_note) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [purchase_id, product_id, variant_id, quantity, linePrice, listPriceFinal, isPromo, isPromo ? (price_note || null) : null]
             );
 
             await connection.query(
@@ -548,6 +553,7 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /compras/:id
+// ✅ El detalle ahora también trae list_price, is_promotional y price_note
 // ========================
 router.get('/:id(\\d+)', async (req, res) => {
     try {
@@ -576,6 +582,9 @@ router.get('/:id(\\d+)', async (req, res) => {
                 v.variant_name,
                 dc.quantity,
                 dc.purchase_price,
+                dc.list_price,
+                dc.is_promotional,
+                dc.price_note,
                 (dc.quantity * dc.purchase_price) AS subtotal
             FROM detalle_compras dc
             JOIN productos p ON dc.product_id = p.id
@@ -613,6 +622,7 @@ router.get('/buscar/:term', async (req, res) => {
 
 // ========================
 // GET /compras/:productId/:supplierId/:variantId
+// (sin cambios — sigue devolviendo el precio de lista como sugerencia)
 // ========================
 router.get('/:productId/:supplierId/:variantId', async (req, res) => {
     try {

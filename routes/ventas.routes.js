@@ -147,7 +147,7 @@ router.post('/', async (req, res) => {
             const costoUnitario = costRows.length ? parseFloat(costRows[0].purchase_price) : 0;
             totalCost += costoUnitario * quantity;
 
-            const puntos = Math.floor(subtotal / 30);
+            const puntos = payment_type === 'cash' ? Math.floor(subtotal / 30) : 0;
             totalEarnedPoints += puntos;
 
             await connection.query(

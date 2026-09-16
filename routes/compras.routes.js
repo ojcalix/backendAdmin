@@ -109,10 +109,15 @@ router.post('/apertura', async (req, res) => {
 
 // ========================
 // POST /compras
-// ✅ Cada producto ahora puede traer list_price (el precio de lista que
-// se sugirió originalmente), is_promotional y price_note. Si el
-// frontend no los manda (compatibilidad hacia atrás), se asume que
+// ✅ Cada producto puede traer list_price (el precio de lista que se
+// sugirió originalmente), is_promotional y price_note. Si el frontend
+// no los manda (compatibilidad hacia atrás), se asume que
 // purchase_price = list_price y que no es promocional.
+// ✅ También recibe shipping_cost (opcional). El total sigue
+// recalculándose siempre desde paid_amount + pending_amount (que ya
+// vienen calculados desde el frontend incluyendo el envío), nunca se
+// confía en purchase_price del body. shipping_cost solo se guarda para
+// que quede registrado y se pueda mostrar en el detalle de la compra.
 // ========================
 router.post('/', async (req, res) => {
     const {
@@ -123,6 +128,7 @@ router.post('/', async (req, res) => {
         payment_method,
         bank_id,
         financing_source_id,
+        shipping_cost,
         paid_amount,
         pending_amount,
         products
@@ -139,6 +145,7 @@ router.post('/', async (req, res) => {
 
     const paidAmountNum = parseFloat(paid_amount) || 0;
     const pendingAmountNum = parseFloat(pending_amount) || 0;
+    const shippingCostNum = parseFloat(shipping_cost) || 0;
     const totalRecalculado = parseFloat((paidAmountNum + pendingAmountNum).toFixed(2));
 
     if (totalRecalculado <= 0) {
@@ -251,9 +258,9 @@ router.post('/', async (req, res) => {
 
         const [compraResult] = await connection.query(
             `INSERT INTO compras 
-                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, paid_amount, pending_amount) 
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, totalRecalculado, paidAmountNum, pendingAmountNum]
+                (supplier_id, user_id, payment_type, payment_status, payment_method, bank_id, financing_source_id, purchase_price, shipping_cost, paid_amount, pending_amount) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [supplier_id, user_id, payment_type, payment_status, normalizedPaymentMethod, bank_id || null, financing_source_id || null, totalRecalculado, shippingCostNum, paidAmountNum, pendingAmountNum]
         );
         const purchase_id = compraResult.insertId;
 
@@ -553,7 +560,8 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /compras/:id
-// ✅ El detalle ahora también trae list_price, is_promotional y price_note
+// ✅ El detalle también trae shipping_cost, list_price, is_promotional
+// y price_note
 // ========================
 router.get('/:id(\\d+)', async (req, res) => {
     try {
@@ -561,7 +569,7 @@ router.get('/:id(\\d+)', async (req, res) => {
 
         const [compra] = await db.query(`
             SELECT 
-                c.id, c.purchase_price, c.purchase_date, c.payment_type, c.payment_status,
+                c.id, c.purchase_price, c.shipping_cost, c.purchase_date, c.payment_type, c.payment_status,
                 c.payment_method, c.paid_amount, c.pending_amount, c.status, c.cancel_reason,
                 u.username, COALESCE(pr.name, 'Apertura de Inventario') AS proveedor,
                 ff.name AS financing_source_name,

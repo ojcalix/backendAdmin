@@ -101,6 +101,8 @@ const routes = [
     { path: '/dashboard', file: './routes/dashboard.routes' },
     { path: '/fuentes_financiamiento', file: './routes/fuentes_financiamiento.routes'},
     { path: '/prestamos', file: './routes/prestamos.routes'},
+    { path: '/descuentos', file: './routes/descuentos.routes'},
+
 ];
 
 routes.forEach(({ path: routePath, file }) => {

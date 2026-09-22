@@ -5,6 +5,10 @@ const { crearAsiento, reversarAsiento } = require('../helpers/contabilidad');
 
 // ========================
 // POST /ventas
+// Cada línea de producto ahora puede traer: discount_type_id,
+// discount_percentage, discount_reason, authorized_by — información
+// del descuento REALMENTE aplicado (además del monto ya restado en
+// subtotal, que sigue funcionando exactamente igual que antes).
 // ========================
 router.post('/', async (req, res) => {
     const {
@@ -32,6 +36,15 @@ router.post('/', async (req, res) => {
 
     if ((payment_type === 'credit' || payment_type === 'mixed') && !customer_id) {
         return res.status(400).json({ error: "Las ventas a crédito o mixtas requieren un cliente." });
+    }
+
+    // ✅ Validar que ningún descuento que requiera autorización venga sin autorizador
+    for (const product of products) {
+        if (product.discount_type_id && product.requires_authorization && !product.authorized_by) {
+            return res.status(400).json({
+                error: `El descuento aplicado en un producto requiere autorización de un administrador.`
+            });
+        }
     }
 
     const entraDinero = (payment_type === 'cash' || payment_type === 'mixed') && paid_amount > 0;
@@ -123,7 +136,10 @@ router.post('/', async (req, res) => {
         let totalCost = 0;
 
         for (const product of products) {
-            const { product_id, variant_id, quantity, subtotal } = product;
+            const {
+                product_id, variant_id, quantity, subtotal,
+                discount_type_id, discount_percentage, discount_reason, authorized_by
+            } = product;
 
             const [variantStockResult] = await connection.query(
                 "SELECT quantity FROM variantes WHERE id = ? FOR UPDATE",
@@ -151,8 +167,12 @@ router.post('/', async (req, res) => {
             totalEarnedPoints += puntos;
 
             await connection.query(
-                "INSERT INTO ventas_detalle (sale_id, product_id, variant_id, quantity, subtotal, earned_points) VALUES (?, ?, ?, ?, ?, ?)",
-                [sale_id, product_id, variant_id, quantity, subtotal, puntos]
+                `INSERT INTO ventas_detalle 
+                    (sale_id, product_id, variant_id, quantity, subtotal, earned_points, 
+                     discount_type_id, discount_percentage, discount_reason, authorized_by) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [sale_id, product_id, variant_id, quantity, subtotal, puntos,
+                    discount_type_id || null, discount_percentage || 0, discount_reason || null, authorized_by || null]
             );
         }
 
@@ -209,9 +229,7 @@ router.post('/', async (req, res) => {
 
 // ========================
 // POST /ventas/:id/cancelar
-// Revierte stock, caja/banco, y genera el asiento contrario.
-// La venta NUNCA se borra — queda marcada como 'cancelada' para
-// mantener el historial completo.
+// (sin cambios de fondo)
 // ========================
 router.post('/:id/cancelar', async (req, res) => {
     const { id } = req.params;
@@ -243,7 +261,6 @@ router.post('/:id/cancelar', async (req, res) => {
             return res.status(400).json({ error: "Esta venta ya está cancelada." });
         }
 
-        // ✅ Bloquear si ya hay abonos posteriores registrados
         const [abonos] = await connection.query(
             "SELECT COUNT(*) AS total FROM pagos_credito WHERE sale_id = ?",
             [id]
@@ -256,7 +273,6 @@ router.post('/:id/cancelar', async (req, res) => {
             });
         }
 
-        // ✅ Regresar el stock de cada variante vendida
         const [detalle] = await connection.query(
             "SELECT variant_id, quantity FROM ventas_detalle WHERE sale_id = ?",
             [id]
@@ -269,7 +285,6 @@ router.post('/:id/cancelar', async (req, res) => {
             );
         }
 
-        // ✅ Revertir efectivo (contra la caja ABIERTA HOY del usuario que cancela)
         if (venta.paid_amount > 0 && venta.payment_method === 'cash') {
             const [cajaResult] = await connection.query(
                 "SELECT id FROM cajas WHERE user_id = ? AND status = 'open' LIMIT 1",
@@ -288,7 +303,6 @@ router.post('/:id/cancelar', async (req, res) => {
             );
         }
 
-        // ✅ Revertir banco
         if (venta.paid_amount > 0 && (venta.payment_method === 'transfer' || venta.payment_method === 'card')) {
             await connection.query(
                 `INSERT INTO movimientos_bancarios (bank_id, type, amount, concept, reference_type, reference_id) 
@@ -302,7 +316,6 @@ router.post('/:id/cancelar', async (req, res) => {
             );
         }
 
-        // ✅ Revertir puntos ganados, si el cliente los sigue teniendo
         if (venta.earned_points > 0 && venta.customer_id) {
             await connection.query(
                 "UPDATE clientes SET accumulated_points = GREATEST(accumulated_points - ?, 0) WHERE id = ?",
@@ -315,7 +328,6 @@ router.post('/:id/cancelar', async (req, res) => {
             );
         }
 
-        // ✅ Generar el asiento contrario exacto al original
         await reversarAsiento(connection, {
             reference_type: 'venta',
             original_reference_id: id,
@@ -373,6 +385,7 @@ router.get('/', async (req, res) => {
 
 // ========================
 // GET /ventas/:id
+// (incluye info del descuento aplicado en cada línea, si hubo)
 // ========================
 router.get('/:id', async (req, res) => {
     const { id } = req.params;
@@ -396,10 +409,14 @@ router.get('/:id', async (req, res) => {
                 var.variant_name,
                 vd.quantity,
                 (vd.subtotal / vd.quantity) AS precio_unitario,
-                vd.subtotal
+                vd.subtotal,
+                vd.discount_percentage,
+                vd.discount_reason,
+                td.name AS discount_type_name
             FROM ventas_detalle vd
             JOIN productos p ON vd.product_id = p.id
             LEFT JOIN variantes var ON vd.variant_id = var.id
+            LEFT JOIN tipos_descuento td ON vd.discount_type_id = td.id
             WHERE vd.sale_id = ?
         `, [id]);
 

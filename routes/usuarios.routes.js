@@ -32,6 +32,50 @@ router.post('/', auth, async (req, res) => {
     }
 });
 
+// ========================
+// POST /usuarios/verificar-password
+// Verifica usuario + contraseña SIN iniciar sesión — se usa para
+// autorizar puntualmente una acción (ej. un descuento que requiere
+// aprobación de un administrador) sin cerrar la sesión del cajero.
+// Solo permite verificar usuarios con rol "Administrador".
+// ========================
+router.post('/verificar-password', auth, async (req, res) => {
+    const { user_id, password } = req.body;
+
+    if (!user_id || !password) {
+        return res.status(400).json({ error: 'Usuario y contraseña son obligatorios.' });
+    }
+
+    try {
+        const [results] = await db.query(
+            'SELECT id, username, password, role FROM usuarios WHERE id = ?',
+            [user_id]
+        );
+
+        if (!results.length) {
+            return res.status(404).json({ error: 'Usuario no encontrado.' });
+        }
+
+        const user = results[0];
+
+        if (user.role !== 'Administrador') {
+            return res.status(403).json({ error: 'Este usuario no tiene permisos de administrador.' });
+        }
+
+        const passwordMatches = await bcrypt.compare(password, user.password);
+
+        if (!passwordMatches) {
+            return res.status(401).json({ error: 'Contraseña incorrecta.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Autorización verificada correctamente.' });
+
+    } catch (err) {
+        console.error('Error al verificar contraseña:', err);
+        res.status(500).json({ error: 'Error al verificar la contraseña' });
+    }
+});
+
 // Obtener usuario por ID
 router.get('/:id', auth, async (req, res) => {
     const userId = req.params.id;

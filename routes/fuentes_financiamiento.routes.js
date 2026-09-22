@@ -70,6 +70,7 @@ router.post('/', async (req, res) => {
                 reference_type: 'ajuste',
                 reference_id: sourceId,
                 user_id,
+                total: balance,
                 lines: [
                     { code: '3101', debit: balance },       // Capital Social
                     { code: accountRow[0].code, credit: balance } // Cuenta de esta fuente
@@ -288,6 +289,7 @@ router.post('/pago', async (req, res) => {
             reference_type: 'pago_financiamiento',
             reference_id: pagoResult.insertId,
             user_id,
+             total: amount,
             lines: [
                 { code: accountRow[0].code, debit: amount },
                 { code: cuentaOrigen, credit: amount }

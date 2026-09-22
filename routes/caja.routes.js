@@ -95,6 +95,7 @@ router.post('/abrir', async (req, res) => {
                 reference_type: 'apertura_caja',
                 reference_id: result.insertId,
                 user_id,
+                total: opening_amount,
                 lines: [
                     { code: '1101', debit: opening_amount },
                     { code: '3101', credit: opening_amount }
@@ -188,6 +189,7 @@ router.post('/cerrar', async (req, res) => {
                         reference_type: 'ajuste',
                         reference_id: gastoInsert.insertId,
                         user_id: caja.user_id,
+                         total: Math.abs(difference),
                         lines: [
                             { code: '6101', debit: Math.abs(difference) },
                             { code: '1101', credit: Math.abs(difference) }
@@ -211,6 +213,7 @@ router.post('/cerrar', async (req, res) => {
                     reference_type: 'ajuste',
                     reference_id: ingresoInsert.insertId,
                     user_id: caja.user_id,
+                    total: difference,
                     lines: [
                         { code: '1101', debit: difference },
                         { code: '4102', credit: difference }

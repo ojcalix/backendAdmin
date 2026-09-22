@@ -221,6 +221,7 @@ router.post('/pago', async (req, res) => {
             reference_type: 'pago_proveedor',
             reference_id: pagoResult.insertId,
             user_id,
+            total: amount,
             lines: [
                 { code: '2101', debit: amount },
                 { code: cuentaOrigen, credit: amount }

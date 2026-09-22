@@ -142,6 +142,7 @@ router.post('/', async (req, res) => {
             reference_type: 'ingreso_extra',
             reference_id: incomeResult.insertId,
             user_id,
+            total: amount,
             lines: [
                 { code: cuentaDestino, debit: amount },
                 { code: '4102', credit: amount }

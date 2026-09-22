@@ -395,6 +395,7 @@ router.post('/', async (req, res) => {
             reference_type: 'ajuste',
             reference_id: prestamoId,
             user_id,
+            total: debtIncrease,
             lines
         });
 
@@ -429,6 +430,7 @@ router.post('/', async (req, res) => {
                 reference_type: 'ajuste',
                 reference_id: prestamoId,
                 user_id,
+                total: totalAparte,
                 lines: [
                     { code: '6104', debit: totalAparte },
                     { code: cuentaOrigenAparte, credit: totalAparte }
@@ -723,6 +725,7 @@ router.post('/pago', async (req, res) => {
             reference_type: 'ajuste',
             reference_id: pagoResult.insertId,
             user_id,
+            total: parseFloat(amount),
             lines
         });
 
@@ -929,6 +932,7 @@ router.post('/:id/abono-capital', async (req, res) => {
             reference_type: 'ajuste',
             reference_id: abonoResult.insertId,
             user_id,
+            total: amount,
             lines: [
                 { code: debtAccount.code, debit: amount },
                 { code: cuentaOrigen, credit: amount }

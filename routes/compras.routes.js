@@ -89,6 +89,7 @@ router.post('/apertura', async (req, res) => {
             reference_type: 'compra',
             reference_id: purchase_id,
             user_id,
+            total,
             lines: [
                 { code: '1104', debit: total },
                 { code: '3101', credit: total }
@@ -372,6 +373,7 @@ router.post('/', async (req, res) => {
             reference_type: 'compra',
             reference_id: purchase_id,
             user_id,
+            total: totalRecalculado,
             lines
         });
 

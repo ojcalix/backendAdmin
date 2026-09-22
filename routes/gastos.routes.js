@@ -236,6 +236,7 @@ router.post('/', async (req, res) => {
             reference_type: 'gasto',
             reference_id: gastoResult.insertId,
             user_id,
+            total: amount,
             lines: [
                 { code: cuentaGasto, debit: amount },
                 { code: cuentaOrigen, credit: amount }

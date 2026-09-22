@@ -128,6 +128,7 @@ router.post('/saldo-inicial', async (req, res) => {
             reference_type: 'venta',
             reference_id: sale_id,
             user_id,
+             total: amount,
             lines: [
                 { code: '1103', debit: amount },
                 { code: '3101', credit: amount }
@@ -263,6 +264,7 @@ router.post('/pago', async (req, res) => {
             reference_type: 'pago_credito',
             reference_id: pagoResult.insertId,
             user_id,
+             total: amount,
             lines: [
                 { code: cuentaDestino, debit: amount },
                 { code: '1103', credit: amount }

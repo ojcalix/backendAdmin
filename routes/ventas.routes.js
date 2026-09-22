@@ -212,6 +212,7 @@ router.post('/', async (req, res) => {
             reference_type: 'venta',
             reference_id: sale_id,
             user_id,
+            total,
             lines
         });
 

@@ -86,8 +86,8 @@ router.get('/libro-diario', async (req, res) => {
                 ac.description,
                 ac.reference_type,
                 ac.reference_id,
-                u.username,
-                (SELECT COALESCE(SUM(debit), 0) FROM asientos_detalle WHERE entry_id = ac.id) AS total
+                ac.total,
+                u.username
             FROM asientos_contables ac
             INNER JOIN usuarios u ON ac.user_id = u.id
             WHERE 1 = 1

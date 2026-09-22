@@ -53,6 +53,7 @@ router.post('/', async (req, res) => {
                 reference_type: 'ajuste',
                 reference_id: result.insertId,
                 user_id,
+                total: initial_balance,
                 lines: [
                     { code: '1102', debit: initial_balance },
                     { code: '3101', credit: initial_balance }
@@ -234,6 +235,7 @@ router.post('/movimiento-manual', async (req, res) => {
                 reference_type: 'ajuste',
                 reference_id: movBancoResult.insertId,
                 user_id,
+                total: amount,
                 lines: type === 'deposit'
                     ? [{ code: '1102', debit: amount }, { code: '1101', credit: amount }]
                     : [{ code: '1101', debit: amount }, { code: '1102', credit: amount }]
@@ -244,6 +246,7 @@ router.post('/movimiento-manual', async (req, res) => {
                 reference_type: 'ajuste',
                 reference_id: movBancoResult.insertId,
                 user_id,
+                total: amount,
                 lines: type === 'deposit'
                     ? [{ code: '1102', debit: amount }, { code: '3101', credit: amount }]
                     : [{ code: '3101', debit: amount }, { code: '1102', credit: amount }]

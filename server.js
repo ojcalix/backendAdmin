@@ -102,6 +102,7 @@ const routes = [
     { path: '/fuentes_financiamiento', file: './routes/fuentes_financiamiento.routes'},
     { path: '/prestamos', file: './routes/prestamos.routes'},
     { path: '/descuentos', file: './routes/descuentos.routes'},
+    { path: '/salidas-inventario', file: './routes/salidasInventario.routes' },
 
 ];
 
